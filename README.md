@@ -17,6 +17,7 @@ Although the subject ID and the coordinator ID is obtainable via MMLS by searchi
 - Timetable ID: A variable digit numerical value tied to a single session of a class throughout the semester. It is pregenerated one or two days ahead of time and does not require manual QR generation from a lecturer for it to exist.
 
 ### Future work
-- Automatically retrieve list of subjects with corresponding IDs via MMLS login
-- Terminate HTML fetching upon encountering ungenerated attendance link (Error 500)
-- Scrape attendance link by date instead of a range of timetable ID
+- Automatically retrieve list of subjects with corresponding IDs via MMLS login.
+- ~~Terminate HTML fetching upon encountering ungenerated attendance link. (Error 500)~~
+- ~~Scrape attendance link by date instead of a range of timetable ID.~~
+- After completing all the above, switch from multithreading to multiprocessing instead.
