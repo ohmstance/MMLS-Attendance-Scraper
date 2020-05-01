@@ -20,4 +20,4 @@ Although the subject ID and the coordinator ID is obtainable via MMLS by searchi
 - Automatically retrieve list of subjects with corresponding IDs via MMLS login.
 - ~~Terminate HTML fetching upon encountering ungenerated attendance link. (Error 500)~~
 - ~~Scrape attendance link by date instead of a range of timetable ID.~~
-- After completing all the above, switch from multithreading to multiprocessing instead.
+- Use lxml instead of BeautifulSoup for performance.
