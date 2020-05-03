@@ -86,8 +86,6 @@ def main():
     workers = 64
 
     startTime = time.time()
-
-
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
         while(True):
             startTimetableID = executor.submit(dateToTimetableID, startDate, 1)
