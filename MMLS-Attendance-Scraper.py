@@ -1,59 +1,63 @@
-from urllib.request import urlopen
-from urllib.error import HTTPError, URLError
-from bs4 import BeautifulSoup, SoupStrainer
-from sys import exit as exit
-from datetime import date, timedelta
 import concurrent.futures
 import time
+from urllib import request, error
+from lxml import etree
+from datetime import date, timedelta
+from sys import exit
+
+baseAttendanceURL = 'https://mmls.mmu.edu.my/attendance'
+baseAttendanceListURL = 'https://mmls.mmu.edu.my/viewAttendance'
 maxTimetableID = 99999
 minTimetableID = 1
 RETRIES = 3
 
 #made by munchbit
-def fetchHTML(timetableID): #Accepts timetable_id. Downloads attendance HTML bearing the timetable_id. If successful, returns BeautifulSoup HTML object, but returns None type otherwise.
+def fetchETree(timetableID): #Accepts timetable_id. Downloads and parses attendance HTML of input timetable_id. Returns ElementTree object, but None type if failed.
     for x in range(RETRIES):
         try:
-            html = BeautifulSoup(urlopen('https://mmls.mmu.edu.my/attendance:0:0:'+str(timetableID), timeout=30), 'html.parser', parse_only = SoupStrainer("input")) #Apparently subjectID and coordinatorID doesn't matter for attendance links
-            return html
-        except HTTPError as error:
-            if error.code == 500:
+            html = request.urlopen(baseAttendanceURL+':0:0:'+str(timetableID), timeout=30)
+            parser = etree.HTMLParser()
+            tree = etree.parse(html, parser)
+            return tree
+        except error.HTTPError as err:
+            if err.code == 500:
                 return None
             else:
                 continue
-        except URLError:
+        except error.URLError:
             continue
     exit("Network error. Try raising number of retries or obtain better network condition.")
 
-def dateToTimetableID(date, option): #Option: 1 for first occurence, -1 for last occurence; Binary search algorithm; Returns None if no classes on that date.
+def dateToTimetableID(date, option): #Option: 1 for first occurence, -1 for last occurence; Binary search algorithm; Returns None if there are no classes on that date.
     upperbound = maxTimetableID
     lowerbound = minTimetableID
     while(True):
         currTimetableID = (upperbound+lowerbound)//2
-        html = fetchHTML(currTimetableID)
-        if html is None:
+        html_etree = fetchETree(currTimetableID)
+        if html_etree is None:
             upperbound = currTimetableID - 1
             continue
-        currDate = date.fromisoformat(html.find('input', id="class_date")['value'])
+        currDate = date.fromisoformat(html_etree.xpath("//input[@name='class_date']")[0].get('value'))
         if (date - currDate).days > 0:
             lowerbound = currTimetableID + 1
         elif (date - currDate).days < 0:
             upperbound = currTimetableID - 1
         elif (date - currDate).days == 0 and option == 1:
-            html = fetchHTML(currTimetableID - 1)
-            if date.fromisoformat(html.find('input', id="class_date")['value']) != currDate:
+            html_etree = fetchETree(currTimetableID - 1)
+            if date.fromisoformat(html_etree.xpath("//input[@name='class_date']")[0].get('value')) != currDate:
                 return currTimetableID
             upperbound = currTimetableID - 1
         elif (date - currDate).days == 0 and option == -1:
-            html = fetchHTML(currTimetableID + 1)
-            if html is None:
+            html_etree = fetchETree(currTimetableID + 1)
+            if html_etree is None:
                 return currTimetableID
-            if date.fromisoformat(html.find('input', id="class_date")['value']) != currDate:
+            if date.fromisoformat(html_etree.xpath("//input[@name='class_date']")[0].get('value')) != currDate:
                 return currTimetableID
             lowerbound = currTimetableID + 1
         if upperbound < lowerbound:
             return None
 
-def askYesNo(question): #Accepts string -- preferably a question. Ask the user if yes, or no. Returns boolean result where y: True and n: False.
+def askYesNo(question): #Accepts string -- preferably a question. Returns boolean result where y: True and n: False.
     while True:
         decision = input("{} (y/n): ".format(question))
         if (decision.lower() == 'y'): return True
@@ -82,7 +86,6 @@ def main():
     workers = 64
 
     startTime = time.time()
-
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
         while(True):
             startTimetableID = executor.submit(dateToTimetableID, startDate, 1)
@@ -97,25 +100,34 @@ def main():
                 print("No classes exist in range.")
             if startTimetableID is None or endTimetableID is None:
                 continue
-            print("\nSearching from {} to {}. Range found in {}s.".format(startDate.isoformat(), endDate.isoformat(), time.time()-startTime))
+            print("\nNow searching from {} to {} at {}s.".format(startDate.isoformat(), endDate.isoformat(), time.time()-startTime))
             break
 
-        futures = [executor.submit(fetchHTML, startTimetableID+x) for x in range(endTimetableID-startTimetableID+1)]
-        while len(futures) > 0: #For as long as there are any futures, result of futures are parsed in order it is submitted. Once done, the queue (list of futures) is popped and the elements are shifted forward. All elements are accessible sequentially in the first element as queue is popped.
-            if futures[0].result() is None:
+        futures = [executor.submit(fetchETree, startTimetableID+x) for x in range(endTimetableID-startTimetableID+1)]
+        while len(futures) > 0: #For as long as there are any futures, result of futures are parsed in order it is submitted.
+            html_etree = futures[0].result()
+            if html_etree is None:
                 for future in futures: concurrent.futures.Future.cancel(future)
                 del futures
                 break
-            parsedClassID = futures[0].result().find('input', id="class_id")['value']
-            for ID in classID:
+            parsedClassID = html_etree.xpath("//input[@name='class_id']")[0].get('value')
+            for index, ID in enumerate(classID):
                 if (parsedClassID == ID):
-                    print("\nClass {}: {} from {} to {} fetched in {}s".format(ID,
-                        futures[0].result().find('input', id="class_date")['value'],
-                        futures[0].result().find('input', id="starttime")['value'],
-                        futures[0].result().find('input', id="endtime")['value'],
+                    print("\nClass {}: {} from {} to {} fetched in {}s".format(
+                        ID,
+                        html_etree.xpath("//input[@name='class_date']")[0].get('value'),
+                        html_etree.xpath("//input[@name='starttime']")[0].get('value'),
+                        html_etree.xpath("//input[@name='endtime']")[0].get('value'),
                         time.time()-startTime))
-                    print("https://mmls.mmu.edu.my/attendance:{}:{}:{}".format(subjectID[classID.index(ID)], coordinatorID[classID.index(ID)], futures[0].result().find('input', id="timetable_id")['value'])) #Returns the attendance link faithful to the real generated link that includes the correct subject id and coordinator id although it doesn't matter in practice -- the attendance system does not check for both of them whether they are for the right subject and coordinator.
-                    print("https://mmls.mmu.edu.my/viewAttendance:{}:{}:{}:{}:1".format(subjectID[classID.index(ID)], coordinatorID[classID.index(ID)], futures[0].result().find('input', id="timetable_id")['value'], ID)) #Unlike the attendance link, the attendance list link requires all IDs to be correct for the respective subject.
+                    print(baseAttendanceURL+":{}:{}:{}".format(
+                        subjectID[index],
+                        coordinatorID[index],
+                        html_etree.xpath("//input[@name='timetable_id']")[0].get('value'))) #Apparently subjectID and coordinatorID doesn't matter for attendance links
+                    print(baseAttendanceListURL+":{}:{}:{}:{}:1".format(
+                        subjectID[index],
+                        coordinatorID[index],
+                        html_etree.xpath("//input[@name='timetable_id']")[0].get('value'),
+                        ID)) #Unlike the attendance link, the attendance list link requires all IDs to be correct for the respective subject.
                     break
             del futures[0]
 
