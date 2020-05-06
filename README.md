@@ -1,5 +1,5 @@
 # MMLS-Attendance-Scraper
-A Python script used to scrape MMU attendance by iterating through timetable IDs and returning those with the same subject ID.
+This is a Python script able to scrape MMU attendance by iterating through timetable IDs and returning those with the same class ID. By using this script, you are aware that obtaining attendance in absence is wrong, and that the act might lead to disciplinary action. The author shall not be liable for any direct, indirect, incidental, special, exemplary, or consequential damages however caused arising in any way out of the use of this software. You must use this software for educational purposes only.
 
 A MMLS attendance link is in the format of:  
 https://mmls.mmu.edu.my/attendance:<subjectID\>:<coordinatorID\>:<timetableID\>
@@ -14,12 +14,12 @@ Although the subject ID and the coordinator ID is obtainable via MMLS in its HTM
 - Subject ID: A variable digit numerical value no more than five digits. It corresponds to a subject.
 - Coordinator ID: A ten digit numerical value corresponding to the coordinator tied to a subject.
 - Class ID: A five digit numerical value tied a classes within a subject.
-- Timetable ID: A variable digit numerical value tied to a single session of a class throughout the semester. It is pregenerated one or two days ahead of time and does not require manual QR generation from a lecturer for it to exist.
+- Timetable ID: A variable digit numerical value tied to a single session of a class throughout the academic year. It is pregenerated -- probably -- one or two days ahead of time by MMLS.
 
 ### Future work
-- ~~Automatically retrieve list of subjects with corresponding IDs via MMLS login.~~
 - ~~Terminate HTML fetching upon encountering ungenerated attendance link. (Error 500)~~
 - ~~Scrape attendance link by date instead of a range of timetable ID.~~
 - ~~Use lxml instead of BeautifulSoup for performance.~~
+- ~~Automatically retrieve list of subjects with corresponding IDs via MMLS login.~~
 - Check how many students have attended in each class session
 - Allow manual input of parameters
