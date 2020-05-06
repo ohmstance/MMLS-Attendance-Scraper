@@ -115,16 +115,24 @@ def userInClass(student_id, cookie, subject_id, coordinator_id, classID): #retur
 
 def main():
     global subjectListDB
-    username = input('Student ID: ')
-    password = getpass.getpass()
+    while True:
+        username = input('\nStudent ID: ')
+        password = getpass.getpass()
 
-    startTime = time.time()
+        startTime = time.time()
 
-    data = parse.urlencode({'username': username, 'password': password})
-    data = data.encode('utf-8')
-    req = request.Request(mmumobileTokenURL, data=data, headers={}, method='POST')
-    response = request.urlopen(req)
+        data = parse.urlencode({'username': username, 'password': password})
+        data = data.encode('utf-8')
+        req = request.Request(mmumobileTokenURL, data=data, headers={}, method='POST')
+        try:
+            response = request.urlopen(req)
+        except error.HTTPError as err:
+            if err.code == 422:
+                print('Invalid student ID or password.')
+                continue
+        break
     mmumobileToken = json.loads(response.read())['token']
+
 
     print('\nObtained mmumobile token at {}s.'.format(time.time()-startTime))
 
