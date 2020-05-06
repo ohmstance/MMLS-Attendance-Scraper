@@ -22,7 +22,6 @@ workers = 64
 RETRIES = 3
 subjectListDB = []
 
-#made by munchbit
 def getURL(url, data):
     string = ''
     for index, keyval in enumerate(data.items()):
