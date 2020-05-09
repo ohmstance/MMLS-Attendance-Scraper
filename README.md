@@ -7,7 +7,7 @@ https://mmls.mmu.edu.my/attendance:<subjectID\>:<coordinatorID\>:<timetableID\>
 Although the subject ID and the coordinator ID is obtainable via MMLS in its HTML code, the timetable ID however isn't easily obtainable. Based on previous attendance links given out by lecturers, the timetable ID consistently increases with time. Skimming through attendance links reveals that each timetable ID is unique to a class throughout MMU; therefore it is theoretically possible to iterate through all timetable IDs to obtain attendance links for a particular class. This Python script automates that.
 
 ### Dependencies
-- Python 3.7 (Implements changes to dict which is presently ordered)
+- Python 3.2
 - lxml (pip module)
 
 ### Glossary
