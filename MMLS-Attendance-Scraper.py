@@ -93,6 +93,12 @@ def editSubjectList():
     except (ValueError, IndexError):
         print('Invalid input.')
 
+def dateFromISOFormat(ISODateString):
+    dateList = ISODateString.split('-')
+    if len(dateList[0]) != 4 or len(dateList[1]) != 2 or len(dateList[2]) != 2:
+        raise ValueError("Invalid isoformat string: '{}'".format(ISODateString))
+    return date(int(dateList[0]), int(dateList[1]), int(dateList[2]))
+
 def parseClasses(subject, cookie):
         subjectClassListURL = mmlsClassListURL + ':' + subject['subject_id'] + ':' + subject['coordinator_id'] + ':0'
         response = getURL(subjectClassListURL, headers={'Cookie': cookie})
@@ -103,7 +109,7 @@ def parseClasses(subject, cookie):
         return classList
 
 def userInClass(student_id, class_id, subject, cookie): #returns boolean
-    url = '{}:{}:{}:{}'.format(mmlsClassListURL, subject['subject_id'], subject['coordinator_id'], class_id) #mmlsClassListURL+':'+subject['subject_id']+':'+subject['coordinator_id']+':'
+    url = '{}:{}:{}:{}'.format(mmlsClassListURL, subject['subject_id'], subject['coordinator_id'], class_id)
     response = getURL(url, headers={'Cookie': cookie})
     tree = etree.parse(response, etree.HTMLParser())
     return True if tree.xpath("//table/tbody/tr/td[text()='{}']".format(student_id)) else False
@@ -188,10 +194,10 @@ def main():
 
         while True:
             try:
-                startDate = date.fromisoformat(input("Search from what date? YYYY-MM-DD: "))
-                endDate = date.fromisoformat(input("Until what date? YYYY-MM-DD: "))
+                startDate = dateFromISOFormat(input("Search from what date? YYYY-MM-DD: "))
+                endDate = dateFromISOFormat(input("Until what date? YYYY-MM-DD: "))
                 break
-            except ValueError:
+            except (ValueError, IndexError):
                 print('Invalid format/input.\n')
                 continue
         startTime = time.time()
