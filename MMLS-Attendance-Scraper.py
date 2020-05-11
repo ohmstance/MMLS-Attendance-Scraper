@@ -232,7 +232,6 @@ def main():
                             html_etree.xpath("//input[@name='timetable_id']")[0].get('value'),
                             class_['class_id'])) #Unlike attendance links, the attendance list links requires all IDs to be correct for the respective subject.
                         break
-                break
             del futures[0]
 
         print("\nCompleted timetable ID scraping attempt in {:.3f}s".format(time.time()-startTime))
