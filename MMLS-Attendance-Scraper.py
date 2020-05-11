@@ -120,17 +120,23 @@ def userInClass(student_id, class_id, subject, cookie): #Returns True if user in
 def main():
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
         global subjectListDB
-        print('====[ MMLS Attendance Scraper ]====')
+        print('-------------------------------')
+        print('|   MMLS Attendance Scraper   |')
+        print('-------------------------------')
         while True:
             userid = input('\nStudent ID: ')
             password = getpass.getpass()
+            if not password or not userid:
+                print('Student ID or password cannot be empty.')
+                continue
             startTime = time.time()
-            try: response = postURL(mmumobileTokenURL, data={'username': userid, 'password': password})
+            try:
+                response = postURL(mmumobileTokenURL, data={'username': userid, 'password': password})
+                break
             except error.HTTPError as err:
                 if err.code == 422: print('Invalid student ID or password.')
                 else: raise error.HTTPError('HTTP Error: {}'.format(err.code))
-            mmumobileToken = json.loads(response.read())['token']
-            break
+        mmumobileToken = json.loads(response.read())['token']
         print('\nObtained mmumobile token at {:.3f}s.'.format(time.time()-startTime))
 
         response = getURL(subjectListURL, data={'token': mmumobileToken})
@@ -211,22 +217,22 @@ def main():
             parsedClassID = html_etree.xpath("//input[@name='class_id']")[0].get('value')
             for subject in subjectListDB:
                 for class_ in subject['classes']:
-                    if class_['selected']:
-                        if (parsedClassID == class_['class_id']):
-                            print("\n{} - {:20} ({}): {} {}-{} (at {:.3f}s)".format(
-                                subject['subject_code'], subject['subject_name'], class_['class_name'],
-                                html_etree.xpath("//input[@name='class_date']")[0].get('value'),
-                                html_etree.xpath("//input[@name='starttime']")[0].get('value')[:-3],
-                                html_etree.xpath("//input[@name='endtime']")[0].get('value')[:-3],
-                                time.time()-startTime))
-                            print(baseAttendanceURL+":{}:{}:{}".format(
-                                subject['subject_id'], subject['coordinator_id'],
-                                html_etree.xpath("//input[@name='timetable_id']")[0].get('value'))) #subjectID and coordinatorID doesn't matter for attendance links
-                            print(baseAttendanceListURL+":{}:{}:{}:{}:1".format(
-                                subject['subject_id'], subject['coordinator_id'],
-                                html_etree.xpath("//input[@name='timetable_id']")[0].get('value'),
-                                class_['class_id'])) #Unlike attendance links, the attendance list links requires all IDs to be correct for the respective subject.
-                            break
+                    if class_['selected'] and (parsedClassID == class_['class_id']):
+                        print("\n{} - {:20} ({}): {} {}-{} (at {:.3f}s)".format(
+                            subject['subject_code'], subject['subject_name'], class_['class_name'],
+                            html_etree.xpath("//input[@name='class_date']")[0].get('value'),
+                            html_etree.xpath("//input[@name='starttime']")[0].get('value')[:-3],
+                            html_etree.xpath("//input[@name='endtime']")[0].get('value')[:-3],
+                            time.time()-startTime))
+                        print(baseAttendanceURL+":{}:{}:{}".format(
+                            subject['subject_id'], subject['coordinator_id'],
+                            html_etree.xpath("//input[@name='timetable_id']")[0].get('value'))) #subjectID and coordinatorID doesn't matter for attendance links
+                        print(baseAttendanceListURL+":{}:{}:{}:{}:1".format(
+                            subject['subject_id'], subject['coordinator_id'],
+                            html_etree.xpath("//input[@name='timetable_id']")[0].get('value'),
+                            class_['class_id'])) #Unlike attendance links, the attendance list links requires all IDs to be correct for the respective subject.
+                        break
+                break
             del futures[0]
 
         print("\nCompleted timetable ID scraping attempt in {:.3f}s".format(time.time()-startTime))
