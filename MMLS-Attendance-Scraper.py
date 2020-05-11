@@ -9,25 +9,27 @@ import getpass
 baseAttendanceURL = 'https://mmls.mmu.edu.my/attendance'
 baseAttendanceListURL = 'https://mmls.mmu.edu.my/viewAttendance'
 mmumobileTokenURL = 'https://mmumobileapps.mmu.edu.my/api/auth/login2?' #username, password. POST
-mmumobileStudentTokenURL = 'https://mmumobileapps.mmu.edu.my/api/camsys/student_key?' #token GET
+subjectListURL = 'https://mmumobileapps.mmu.edu.my/api/mmls/subject?' #token. GET
+mmumobileLogoutURL = 'https://mmumobileapps.mmu.edu.my/api/logout?' #token. GET
 mmlsLoginURL = 'https://mmls.mmu.edu.my/checklogin?' #stud_id, stud_pswrd, _token. POST
 mmlsURL = 'https://mmls.mmu.edu.my/'
 mmlsClassListURL = 'https://mmls.mmu.edu.my/studentlist'
 mmlsLogoutURL = 'https://mmls.mmu.edu.my/logout' #headers: cookie. GET
-subjectListURL = 'https://mmumobileapps.mmu.edu.my/api/mmls/subject?' #token. GET
-timetableURL = 'https://mmumobileapps.mmu.edu.my/api/camsys/timetable/' #+<student_token>?token=<token>. GET
-mmumobileLogoutURL = 'https://mmumobileapps.mmu.edu.my/api/logout?' #token. GET
 maxTimetableID = 99999
 minTimetableID = 1
 workers = 64
 RETRIES = 3
 subjectListDB = []
 
-def getURL(url, *, data={}, headers={}):
-    string = parse.urlencode(data)
-    req = request.Request(url+string, data=None, headers=headers, method='GET')
-    response = request.urlopen(req)
-    return response
+def getURL(url, *, data={}, headers={}): #Sends GET request, returns HTTP response.
+    data = parse.urlencode(data)
+    req = request.Request(url+data, data=None, headers=headers, method='GET')
+    return request.urlopen(req)
+
+def postURL(url, *, data=None, headers={}): #Sends POST request, returns HTTP response.
+    data = parse.urlencode(data).encode('utf-8') if data else None
+    req = request.Request(url, data=data, headers=headers, method='POST')
+    return request.urlopen(req)
 
 def fetchETree(timetableID): #Accepts timetable_id. Downloads and parses attendance HTML of input timetable_id. Returns ElementTree object, but None type if failed.
     for x in range(RETRIES):
@@ -41,7 +43,7 @@ def fetchETree(timetableID): #Accepts timetable_id. Downloads and parses attenda
             pass
     raise error.URLError("Network error. Try raising number of retries or obtain better network condition.")
 
-def dateToTimetableID(date, option): #Option: 1 for first occurence, -1 for last occurence; Binary search algorithm; Returns None if there are no classes on that date.
+def dateToTimetableID(date, option): #Option: 1 for first occurence, -1 for last occurence; Binary search algorithm; Returns None if no class on that date.
     upperbound = maxTimetableID
     lowerbound = minTimetableID
     while(True):
@@ -79,13 +81,13 @@ def askYesNo(question): #Accepts string -- preferably a question. Returns boolea
             print("Invalid input.")
             continue
 
-def printSubjectList():
+def printSubjectList(): #Prints all subjects in SubjectListDB prettily.
     for index, subject in enumerate(subjectListDB):
         print("{}. {} - {}".format(index+1, subject['subject_code'], subject['subject_name']))
         for class_ in subject['classes']:
             print('   [{}] {}'.format('X' if class_['selected'] else ' ', class_['class_name']))
 
-def editSubjectList():
+def editSubjectList(): #User interface for making class search selection in SubjectListDB.
     try:
         subject = int(input('Select which subject?: '))-1
         classes = [int(class_)-1 for class_ in input("Toggle which classes?: ").split(' ')]
@@ -94,13 +96,13 @@ def editSubjectList():
     except (ValueError, IndexError):
         print('Invalid input.')
 
-def dateFromISOFormat(ISODateString):
+def dateFromISOFormat(ISODateString): #Same as date.fromisoformat for use in Python versions prior 3.7
     dateList = ISODateString.split('-')
     if len(dateList[0]) != 4 or len(dateList[1]) != 2 or len(dateList[2]) != 2:
         raise ValueError("Invalid isoformat string: '{}'".format(ISODateString))
     return date(int(dateList[0]), int(dateList[1]), int(dateList[2]))
 
-def parseClasses(subject, cookie):
+def parseClasses(subject, cookie): #Accepts subject dict in SubjectListDB and cookie for MMLS. Returns a list of class dicts.
         subjectClassListURL = mmlsClassListURL + ':' + subject['subject_id'] + ':' + subject['coordinator_id'] + ':0'
         response = getURL(subjectClassListURL, headers={'Cookie': cookie})
         tree = etree.parse(response, etree.HTMLParser())
@@ -109,7 +111,7 @@ def parseClasses(subject, cookie):
         classList = [{'class_name' : class_[0], 'class_id' : class_[1], 'selected' : False} for class_ in zip(classNames, classIDs)]
         return classList
 
-def userInClass(student_id, class_id, subject, cookie): #returns boolean
+def userInClass(student_id, class_id, subject, cookie): #Returns True if user in class, False otherwise.
     url = '{}:{}:{}:{}'.format(mmlsClassListURL, subject['subject_id'], subject['coordinator_id'], class_id)
     response = getURL(url, headers={'Cookie': cookie})
     tree = etree.parse(response, etree.HTMLParser())
@@ -118,23 +120,17 @@ def userInClass(student_id, class_id, subject, cookie): #returns boolean
 def main():
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
         global subjectListDB
+        print('====[ MMLS Attendance Scraper ]====')
         while True:
             userid = input('\nStudent ID: ')
             password = getpass.getpass()
-
             startTime = time.time()
-            data = parse.urlencode({'username': userid, 'password': password})
-            data = data.encode('utf-8')
-            req = request.Request(mmumobileTokenURL, data=data, headers={}, method='POST')
-            try:
-                response = request.urlopen(req)
+            try: response = postURL(mmumobileTokenURL, data={'username': userid, 'password': password})
             except error.HTTPError as err:
-                if err.code == 422:
-                    print('Invalid student ID or password.')
-                    continue
+                if err.code == 422: print('Invalid student ID or password.')
+                else: raise error.HTTPError('HTTP Error: {}'.format(err.code))
+            mmumobileToken = json.loads(response.read())['token']
             break
-        mmumobileToken = json.loads(response.read())['token']
-
         print('\nObtained mmumobile token at {:.3f}s.'.format(time.time()-startTime))
 
         response = getURL(subjectListURL, data={'token': mmumobileToken})
@@ -147,34 +143,21 @@ def main():
                 'coordinator_id' : subject['coordinator_id'], #Eg. 1585369691
                 'classes' : [] #List of classes in dict, with its class code and select attribute.
             })
-
-        data = parse.urlencode({'token': mmumobileToken}).encode('utf-8')
-        req = request.Request(mmumobileLogoutURL, data=data, headers={}, method='POST')
-        request.urlopen(req)
+        postURL(mmumobileLogoutURL, data={'token': mmumobileToken}) #Expires MMU Mobile Apps API token
         print('Parsed registered subject(s) at {:.3f}s.'.format(time.time()-startTime))
 
         response = request.urlopen(mmlsURL)
         cookie = response.info()['Set-Cookie']
         tree = etree.parse(response, etree.HTMLParser())
         _token = tree.xpath("//input[@name='_token']")[0].get('value')
+        print('Obtained _token string and cookie at {:.3f}s'.format(time.time()-startTime))
 
-        print('Obtained _token string at {:.3f}s'.format(time.time()-startTime))
-
-        data = parse.urlencode({
-            'stud_id' : userid,
-            'stud_pswrd' : password,
-            '_token' : _token
-        })
-        data = data.encode('utf-8')
-        req = request.Request(mmlsLoginURL, data=data, headers={'Cookie': cookie}, method='POST')
-        response = request.urlopen(req) #Expires MMU Mobile Apps API token
-
+        postURL(mmlsLoginURL, data={'stud_id': userid, 'stud_pswrd': password, '_token': _token}, headers={'Cookie': cookie})
         print('Logged in to MMLS at {:.3f}s.'.format(time.time()-startTime))
 
         futures = [executor.submit(parseClasses, subject, cookie) for subject in subjectListDB]
         for index, classesFuture in enumerate(futures):
             subjectListDB[index]['classes'] = classesFuture.result()
-
         print('Parsed class(es) in subject(s) at {:.3f}s.\n'.format(time.time()-startTime))
 
         printSubjectList()
@@ -185,8 +168,8 @@ def main():
                 for classIndex, classExistFuture in enumerate(future):
                     if classExistFuture.result():
                         subjectListDB[subjectIndex]['classes'][classIndex]['selected'] = True
-            print('Registered classes lookup took {:.3f}s'.format(time.time()-startTime))
             getURL(mmlsLogoutURL, headers = {'Cookie': cookie}) #Expires MMLS cookie
+            print('Registered classes lookup took {:.3f}s'.format(time.time()-startTime))
         else:
             getURL(mmlsLogoutURL, headers = {'Cookie': cookie})
             print('Manual search selection.')
@@ -208,29 +191,22 @@ def main():
                 continue
         startTime = time.time()
         while(True):
-            startTimetableID = executor.submit(dateToTimetableID, startDate, 1)
-            endTimetableID = executor.submit(dateToTimetableID, endDate, -1)
-            startTimetableID = startTimetableID.result()
-            endTimetableID = endTimetableID.result()
-            if startTimetableID is None:
-                startDate += timedelta(days=1)
-            if endTimetableID is None:
-                endDate -= timedelta(days=1)
+            startTimetableID, endTimetableID = executor.submit(dateToTimetableID, startDate, 1), executor.submit(dateToTimetableID, endDate, -1)
+            startTimetableID, endTimetableID = startTimetableID.result(), endTimetableID.result()
+            if startTimetableID is None: startDate += timedelta(days=1)
+            if endTimetableID is None: endDate -= timedelta(days=1)
             if startDate > endDate:
-                print('No classes found in range. It is probably yet to be generated.')
+                print('No timetable_id found in range. It is probably yet to be generated.')
                 futures = False
                 break
-            if startTimetableID is None or endTimetableID is None:
-                continue
-            print('Found the range of timetable_id at {:.3f}s'.format(time.time()-startTime))
-            if startDate == endDate:
-                print('Searching classes in {}.'.format(startDate.isoformat()))
-            else:
-                print('Searching classes from {} to {}.'.format(startDate.isoformat(), endDate.isoformat()))
-            futures = [executor.submit(fetchETree, startTimetableID+x) for x in range(endTimetableID-startTimetableID+1)]
-            break
+            elif startTimetableID and endTimetableID:
+                break
+        print('Found the range of timetable_id at {:.3f}s'.format(time.time()-startTime))
+        if startDate == endDate: print('Searching classes in {}.'.format(startDate.isoformat()))
+        else: print('Searching classes from {} to {}.'.format(startDate.isoformat(), endDate.isoformat()))
+        futures = [executor.submit(fetchETree, startTimetableID+x) for x in range(endTimetableID-startTimetableID+1)]
 
-        while futures: #For as long as there are any futures, result of futures are parsed in order it is submitted.
+        while futures: #For as long as there are any futures, result of futures are parsed and printed in order it is submitted.
             html_etree = futures[0].result()
             parsedClassID = html_etree.xpath("//input[@name='class_id']")[0].get('value')
             for subject in subjectListDB:
@@ -245,11 +221,11 @@ def main():
                                 time.time()-startTime))
                             print(baseAttendanceURL+":{}:{}:{}".format(
                                 subject['subject_id'], subject['coordinator_id'],
-                                html_etree.xpath("//input[@name='timetable_id']")[0].get('value'))) #Apparently subjectID and coordinatorID doesn't matter for attendance links
+                                html_etree.xpath("//input[@name='timetable_id']")[0].get('value'))) #subjectID and coordinatorID doesn't matter for attendance links
                             print(baseAttendanceListURL+":{}:{}:{}:{}:1".format(
                                 subject['subject_id'], subject['coordinator_id'],
                                 html_etree.xpath("//input[@name='timetable_id']")[0].get('value'),
-                                class_['class_id'])) #Unlike the attendance link, the attendance list link requires all IDs to be correct for the respective subject.
+                                class_['class_id'])) #Unlike attendance links, the attendance list links requires all IDs to be correct for the respective subject.
                             break
             del futures[0]
 
