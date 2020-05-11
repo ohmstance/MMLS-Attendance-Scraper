@@ -1,3 +1,4 @@
+<sub><sub>MMU pls fix</sub></sub>
 # MMLS-Attendance-Scraper
 This is a Python script able to scrape MMU attendance by iterating through timetable IDs and returning those with the same class ID. By using this script, you are aware that obtaining attendance in absence is wrong, and that the act might lead to disciplinary action. The author shall not be liable for any direct, indirect, incidental, special, exemplary, or consequential damages however caused arising in any way out of the use of this software. You must use this software for educational purposes only.
 
