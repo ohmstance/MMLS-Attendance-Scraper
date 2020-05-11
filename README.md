@@ -25,5 +25,5 @@ Although the subject ID and the coordinator ID is obtainable via MMLS in its HTM
 - Allow manual input of parameters
 
 ### Addendum
-https://github.com/ToraNova/sleep-in
-It appears I am not the first. ToraNova created 'sleep-in' back in the end of 2018 probably as an assignment. Well, until now, this weakness still isn't fixed. His' is written in Java and differs to mine in that the software bruteforces sign-ins through attendance links one-by-one in a specified range of timetable_id. Though, it's slow as it's not multithreaded.
+[ToraNova/sleep-in](https://github.com/ToraNova/sleep-in)
+It appears I am not the first. ToraNova created an aptly named 'sleep-in' back in the end of 2018 probably as an assignment. Well, until now, this weakness still isn't fixed. His' is written in Java and differs to mine in that the software bruteforces sign-ins through attendance links one-by-one in a specified range of timetable_id. Though, it's slow as it's not multithreaded.
