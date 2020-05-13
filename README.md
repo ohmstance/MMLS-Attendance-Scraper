@@ -25,6 +25,7 @@ Although the subject ID and the coordinator ID is obtainable via MMLS in its HTM
 - [ ] Check how many students have attended in each class session
 - [ ] Allow manual input of parameters
 - [ ] Parallelize binary search algorithm further
+- [ ] Timetable ID search function should return intervals of ID instead of a singular ID
 
 ### Addendum
 https://github.com/ToraNova/sleep-in  
