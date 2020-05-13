@@ -221,10 +221,10 @@ def main():
                 futures = False
                 break
             elif startTimetableID and endTimetableID:
+                print('Found the range of timetable_id at {:.3f}s'.format(time.time()-startTime))
+                print('Searching classes from {} ({}) to {} ({}).'.format(startTimetableID, startDate.isoformat(), endTimetableID, endDate.isoformat()))
+                futures = [executor.submit(fetchETree, startTimetableID+x) for x in range(endTimetableID-startTimetableID+1)]
                 break
-        print('Found the range of timetable_id at {:.3f}s'.format(time.time()-startTime))
-        print('Searching classes from {} ({}) to {} ({}).'.format(startTimetableID, startDate.isoformat(), endTimetableID, endDate.isoformat()))
-        futures = [executor.submit(fetchETree, startTimetableID+x) for x in range(endTimetableID-startTimetableID+1)] #Change
 
         while futures: #For as long as there are any futures, result of futures are parsed and printed in order it is submitted.
             html_etree = futures[0].result()
