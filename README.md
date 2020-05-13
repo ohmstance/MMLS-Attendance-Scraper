@@ -17,16 +17,6 @@ Although the subject ID and the coordinator ID is obtainable via MMLS in its HTM
 - Class ID: A five digit numerical value tied a classes within a subject.
 - Timetable ID: A variable digit numerical value tied to a single session of a class throughout the academic year. It is pregenerated -- probably -- one or two days ahead of time by MMLS.
 
-### Future work
-- [x] Terminate HTML fetching upon encountering ungenerated attendance link. (Error 500)
-- [x] Scrape attendance link by date instead of a range of timetable ID.
-- [x] Use lxml instead of BeautifulSoup for performance.
-- [x] Automatically retrieve list of subjects with corresponding IDs via MMLS login.
-- [ ] Check how many students have attended in each class session
-- [ ] Allow manual input of parameters
-- [ ] Parallelize binary search algorithm further
-- [ ] Timetable ID search function should return intervals of ID instead of a singular ID
-
 ### Addendum
 https://github.com/ToraNova/sleep-in  
 It appears I am not the first. ToraNova created an aptly named 'sleep-in' back in the end of 2018 probably as an assignment. Well, until now, this weakness still isn't fixed. His' is written in Java and differs to mine in that the software bruteforces sign-ins through attendance links one-by-one in a specified range of timetable_id. Though, it's slow as it's not multithreaded.
