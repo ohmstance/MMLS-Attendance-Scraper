@@ -43,34 +43,47 @@ def fetchETree(timetableID): #Accepts timetable_id. Downloads and parses attenda
             pass
     raise error.URLError("Network error. Try raising number of retries or obtain better network condition.")
 
-def dateToTimetableID(date, option): #Option: 1 for first occurence, -1 for last occurence; Binary search algorithm; Returns None if no class on that date.
-    upperbound = maxTimetableID
-    lowerbound = minTimetableID
+def dateToTimetableID(date, option, ensureCatch = False, upperbound = maxTimetableID, lowerbound = minTimetableID): #Option: 1 for first occurence, -1 for last occurence; Binary search algorithm; Returns None if no class on that date.
     while(True):
         currTimetableID = (upperbound+lowerbound)//2
         html_etree = fetchETree(currTimetableID)
-        if html_etree is None:
-            upperbound = currTimetableID - 1
+        if not html_etree:
+            upperbound = currTimetableID-1
             continue
         currDate = dateFromISOFormat(html_etree.xpath("//input[@name='class_date']")[0].get('value'))
         if (date - currDate).days > 0:
-            lowerbound = currTimetableID + 1
+            lowerbound = currTimetableID+1
         elif (date - currDate).days < 0:
-            upperbound = currTimetableID - 1
+            upperbound = currTimetableID-1
         elif (date - currDate).days == 0 and option == 1:
-            html_etree = fetchETree(currTimetableID - 1)
+            html_etree = fetchETree(currTimetableID-1)
             if dateFromISOFormat(html_etree.xpath("//input[@name='class_date']")[0].get('value')) != currDate:
-                return currTimetableID
-            upperbound = currTimetableID - 1
+                if ensureCatch:
+                    check = dateToTimetableID(date, option, ensureCatch, currTimetableID-1, minTimetableID)
+                    return check if check else currTimetableID
+                else:
+                    return currTimetableID
+            upperbound = currTimetableID-1
         elif (date - currDate).days == 0 and option == -1:
-            html_etree = fetchETree(currTimetableID + 1)
-            if html_etree is None:
-                return currTimetableID
+            html_etree = fetchETree(currTimetableID+1)
+            if not html_etree:
+                if ensureCatch:
+                    check = dateToTimetableID(date, option, ensureCatch, maxTimetableID, currTimetableID+1)
+                    return check if check else currTimetableID
+                else:
+                    return currTimetableID
             if dateFromISOFormat(html_etree.xpath("//input[@name='class_date']")[0].get('value')) != currDate:
-                return currTimetableID
-            lowerbound = currTimetableID + 1
+                if ensureCatch:
+                    check = dateToTimetableID(date, option, ensureCatch, maxTimetableID, currTimetableID+1)
+                    return check if check else currTimetableID
+                else:
+                    return currTimetableID
+            lowerbound = currTimetableID+1
         if upperbound < lowerbound:
             return None
+
+def checkDateInRange(date, startDate, endDate):
+    return True if (0 <= (date-startDate).days <= (endDate-startDate).days) else False
 
 def askYesNo(question): #Accepts string -- preferably a question. Returns boolean result where y: True and n: False.
     while True:
@@ -195,9 +208,11 @@ def main():
             except (ValueError, IndexError):
                 print('Invalid format/input.\n')
                 continue
+        ensureCatch = askYesNo('Ensure all timetable ID in date range is caught?') #As binary search only works on sorted data, it can miss some timetable ID in date range if there are unsorted timetable ID. This flag ensures dateToTimetableID() calls itself to search timetable IDs beyond the local interval of timetable ID it found at the expense of speed.
         startTime = time.time()
         while(True):
-            startTimetableID, endTimetableID = executor.submit(dateToTimetableID, startDate, 1), executor.submit(dateToTimetableID, endDate, -1)
+            startTimetableID = executor.submit(dateToTimetableID, startDate, 1, ensureCatch)
+            endTimetableID = executor.submit(dateToTimetableID, endDate, -1, ensureCatch)
             startTimetableID, endTimetableID = startTimetableID.result(), endTimetableID.result()
             if startTimetableID is None: startDate += timedelta(days=1)
             if endTimetableID is None: endDate -= timedelta(days=1)
@@ -208,9 +223,8 @@ def main():
             elif startTimetableID and endTimetableID:
                 break
         print('Found the range of timetable_id at {:.3f}s'.format(time.time()-startTime))
-        if startDate == endDate: print('Searching classes in {}.'.format(startDate.isoformat()))
-        else: print('Searching classes from {} to {}.'.format(startDate.isoformat(), endDate.isoformat()))
-        futures = [executor.submit(fetchETree, startTimetableID+x) for x in range(endTimetableID-startTimetableID+1)]
+        print('Searching classes from {} ({}) to {} ({}).'.format(startTimetableID, startDate.isoformat(), endTimetableID, endDate.isoformat()))
+        futures = [executor.submit(fetchETree, startTimetableID+x) for x in range(endTimetableID-startTimetableID+1)] #Change
 
         while futures: #For as long as there are any futures, result of futures are parsed and printed in order it is submitted.
             html_etree = futures[0].result()
@@ -218,19 +232,20 @@ def main():
             for subject in subjectListDB:
                 for class_ in subject['classes']:
                     if class_['selected'] and (parsedClassID == class_['class_id']):
-                        print("\n{} - {:20} ({}): {} {}-{} (at {:.3f}s)".format(
-                            subject['subject_code'], subject['subject_name'], class_['class_name'],
-                            html_etree.xpath("//input[@name='class_date']")[0].get('value'),
-                            html_etree.xpath("//input[@name='starttime']")[0].get('value')[:-3],
-                            html_etree.xpath("//input[@name='endtime']")[0].get('value')[:-3],
-                            time.time()-startTime))
-                        print(baseAttendanceURL+":{}:{}:{}".format(
-                            subject['subject_id'], subject['coordinator_id'],
-                            html_etree.xpath("//input[@name='timetable_id']")[0].get('value'))) #subjectID and coordinatorID doesn't matter for attendance links
-                        print(baseAttendanceListURL+":{}:{}:{}:{}:1".format(
-                            subject['subject_id'], subject['coordinator_id'],
-                            html_etree.xpath("//input[@name='timetable_id']")[0].get('value'),
-                            class_['class_id'])) #Unlike attendance links, the attendance list links requires all IDs to be correct for the respective subject.
+                        if checkDateInRange(dateFromISOFormat(html_etree.xpath("//input[@name='class_date']")[0].get('value')), startDate, endDate):
+                            print("\n{} - {:20} ({}): {} {}-{} (at {:.3f}s)".format(
+                                subject['subject_code'], subject['subject_name'], class_['class_name'],
+                                html_etree.xpath("//input[@name='class_date']")[0].get('value'),
+                                html_etree.xpath("//input[@name='starttime']")[0].get('value')[:-3],
+                                html_etree.xpath("//input[@name='endtime']")[0].get('value')[:-3],
+                                time.time()-startTime))
+                            print(baseAttendanceURL+":{}:{}:{}".format(
+                                subject['subject_id'], subject['coordinator_id'],
+                                html_etree.xpath("//input[@name='timetable_id']")[0].get('value'))) #subjectID and coordinatorID doesn't matter for attendance links
+                            print(baseAttendanceListURL+":{}:{}:{}:{}:1".format(
+                                subject['subject_id'], subject['coordinator_id'],
+                                html_etree.xpath("//input[@name='timetable_id']")[0].get('value'),
+                                class_['class_id'])) #Unlike attendance links, the attendance list links requires all IDs to be correct for the respective subject.
                         break
             del futures[0]
 
