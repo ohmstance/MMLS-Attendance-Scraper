@@ -43,7 +43,7 @@ def fetchETree(timetableID): #Accepts timetable_id. Downloads and parses attenda
             pass
     raise error.URLError("Network error. Try raising number of retries or obtain better network condition.")
 
-def dateToTimetableID(date, option, ensureCatch = False, upperbound = maxTimetableID, lowerbound = minTimetableID):
+def dateToTimetableID(date, option, upperbound = maxTimetableID, lowerbound = minTimetableID):
     while(True): #Option: 1 for first occurence, -1 for last occurence; Binary search algorithm; Returns None if no class on that date.
         currTimetableID = (upperbound+lowerbound)//2
         html_etree = fetchETree(currTimetableID)
@@ -58,26 +58,14 @@ def dateToTimetableID(date, option, ensureCatch = False, upperbound = maxTimetab
         elif (date - currDate).days == 0 and option == 1:
             html_etree = fetchETree(currTimetableID-1)
             if dateFromISOFormat(html_etree.xpath("//input[@name='class_date']")[0].get('value')) != currDate:
-                if ensureCatch:
-                    check = dateToTimetableID(date, option, ensureCatch, currTimetableID-1, minTimetableID)
-                    return check if check else currTimetableID
-                else:
-                    return currTimetableID
+                return currTimetableID
             upperbound = currTimetableID-1
         elif (date - currDate).days == 0 and option == -1:
             html_etree = fetchETree(currTimetableID+1)
             if not html_etree:
-                if ensureCatch:
-                    check = dateToTimetableID(date, option, ensureCatch, maxTimetableID, currTimetableID+1)
-                    return check if check else currTimetableID
-                else:
-                    return currTimetableID
+                return currTimetableID
             if dateFromISOFormat(html_etree.xpath("//input[@name='class_date']")[0].get('value')) != currDate:
-                if ensureCatch:
-                    check = dateToTimetableID(date, option, ensureCatch, maxTimetableID, currTimetableID+1)
-                    return check if check else currTimetableID
-                else:
-                    return currTimetableID
+                return currTimetableID
             lowerbound = currTimetableID+1
         if upperbound < lowerbound:
             return None
@@ -209,7 +197,6 @@ def main():
                 except (ValueError, IndexError):
                     print('Invalid format/input.\n')
                     continue
-            # ensureCatch = askYesNo('Ensure all timetable ID in date range is caught?')
             startTime = time.time()
             while(True):
                 startTimetableID = executor.submit(dateToTimetableID, startDate, 1)
