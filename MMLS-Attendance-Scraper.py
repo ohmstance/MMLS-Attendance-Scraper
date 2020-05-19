@@ -12,7 +12,8 @@ mmumobileTokenURL = 'https://mmumobileapps.mmu.edu.my/api/auth/login2?' #usernam
 subjectListURL = 'https://mmumobileapps.mmu.edu.my/api/mmls/subject?' #token. GET
 mmumobileLogoutURL = 'https://mmumobileapps.mmu.edu.my/api/logout?' #token. GET
 mmlsLoginURL = 'https://mmls.mmu.edu.my/checklogin?' #stud_id, stud_pswrd, _token. POST
-mmlsURL = 'https://mmls.mmu.edu.my/'
+mmlsAttendanceLoginURL= 'https://mmls.mmu.edu.my/attendancelogin?' #stud_id, stud_pswrd, timetable_id, starttime, endtime, class_date, class_id, _token. POST.
+mmlsURL = 'https://mmls.mmu.edu.my/' #^^^Need Referer header: any attendance link.
 mmlsClassListURL = 'https://mmls.mmu.edu.my/studentlist'
 mmlsLogoutURL = 'https://mmls.mmu.edu.my/logout' #headers: cookie. GET
 maxTimetableID = 99999
@@ -104,19 +105,21 @@ def dateFromISOFormat(ISODateString): #Same as date.fromisoformat for use in Pyt
     return date(int(dateList[0]), int(dateList[1]), int(dateList[2]))
 
 def parseClasses(subject, cookie): #Accepts subject dict in SubjectListDB and cookie for MMLS. Returns a list of class dicts.
-        subjectClassListURL = mmlsClassListURL + ':' + subject['subject_id'] + ':' + subject['coordinator_id'] + ':0'
-        response = getURL(subjectClassListURL, headers={'Cookie': cookie})
-        tree = etree.parse(response, etree.HTMLParser())
-        classIDs = [classID.get('value') for classID in tree.xpath("//select[@id='select_class']/*[not(self::option[@value='0'])]")]
-        classNames = tree.xpath("//select[@id='select_class']/*[not(self::option[@value='0'])]/text()")
-        classList = [{'class_name' : class_[0], 'class_id' : class_[1], 'selected' : False} for class_ in zip(classNames, classIDs)]
-        return classList
-
-def userInClass(student_id, class_id, subject, cookie): #Returns True if user in class, False otherwise.
-    url = '{}:{}:{}:{}'.format(mmlsClassListURL, subject['subject_id'], subject['coordinator_id'], class_id)
-    response = getURL(url, headers={'Cookie': cookie})
+    subjectClassListURL = mmlsClassListURL + ':' + subject['subject_id'] + ':' + subject['coordinator_id'] + ':0'
+    response = getURL(subjectClassListURL, headers={'Cookie': cookie})
     tree = etree.parse(response, etree.HTMLParser())
-    return True if tree.xpath("//table/tbody/tr/td[text()='{}']".format(student_id)) else False
+    classIDs = [classID.get('value') for classID in tree.xpath("//select[@id='select_class']/*[not(self::option[@value='0'])]")]
+    classNames = tree.xpath("//select[@id='select_class']/*[not(self::option[@value='0'])]/text()")
+    classList = [{'class_name' : class_[0], 'class_id' : class_[1], 'selected' : False} for class_ in zip(classNames, classIDs)]
+    return classList
+
+def userInClass(student_id, class_id): #Returns True if user in class, False otherwise.
+    cookie = request.urlopen('https://mmls.mmu.edu.my/attendance:0:0:1').info()['Set-Cookie']
+    data_params = {'stud_id': student_id, 'stud_pswrd': '0', 'class_id': class_id}
+    header_params = {'Cookie': cookie, 'Referer': 'https://mmls.mmu.edu.my/attendance:0:0:1'}
+    response = postURL(mmlsAttendanceLoginURL, data=data_params, headers=header_params)
+    tree = etree.parse(response, etree.HTMLParser())
+    return False if tree.xpath("//div[@class='alert alert-danger']/text()='You are not register to this class.'") else True
 
 def main():
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
@@ -124,11 +127,22 @@ def main():
         print('-------------------------------')
         print('|   MMLS Attendance Scraper   |')
         print('-------------------------------')
+        print('\nHow do you want to scrape attendance links?:')
+        print('1. Retrieve classes via MMLS login and search by date.')
+        print('2. Retrieve classes via MMLS login and search by range of timetable_id.')
         while True:
-            userid = input('\nStudent ID: ')
+            try:
+                whatToDo = int(input('\nChoice: '))
+                if not 0 < whatToDo < 3:
+                    raise ValueError
+                break
+            except ValueError:
+                print('Invalid input.')
+        while True:
+            userid = input('Student ID: ')
             password = getpass.getpass()
             if not password or not userid:
-                print('Student ID or password cannot be empty.')
+                print('Student ID or password cannot be empty.\n')
                 continue
             startTime = time.time()
             try:
@@ -165,22 +179,15 @@ def main():
         futures = [executor.submit(parseClasses, subject, cookie) for subject in subjectListDB]
         for index, classesFuture in enumerate(futures):
             subjectListDB[index]['classes'] = classesFuture.result()
-        print('Parsed class(es) in subject(s) at {:.3f}s.\n'.format(time.time()-startTime))
+        print('Parsed class(es) in subject(s) at {:.3f}s.'.format(time.time()-startTime))
 
-        printSubjectList()
-        if askYesNo('\nAutomatically fill registered classes?'):
-            startTime = time.time()
-            futures = [[executor.submit(userInClass, userid, class_['class_id'], subject, cookie) for class_ in subject['classes']] for subject in subjectListDB]
-            for subjectIndex, future in enumerate(futures):
-                for classIndex, classExistFuture in enumerate(future):
-                    if classExistFuture.result():
-                        subjectListDB[subjectIndex]['classes'][classIndex]['selected'] = True
-            getURL(mmlsLogoutURL, headers = {'Cookie': cookie}) #Expires MMLS cookie
-            print('Registered classes lookup took {:.3f}s'.format(time.time()-startTime))
-        else:
-            getURL(mmlsLogoutURL, headers = {'Cookie': cookie})
-            print('Manual search selection.')
-            editSubjectList()
+        futures = [[executor.submit(userInClass, userid, class_['class_id']) for class_ in subject['classes']] for subject in subjectListDB]
+        for subjectIndex, future in enumerate(futures):
+            for classIndex, classExistFuture in enumerate(future):
+                if classExistFuture.result():
+                    subjectListDB[subjectIndex]['classes'][classIndex]['selected'] = True
+        getURL(mmlsLogoutURL, headers = {'Cookie': cookie}) #Expires MMLS cookie
+        print('Looked up registered classes at {:.3f}s'.format(time.time()-startTime))
 
         while True:
             print('')
@@ -188,7 +195,7 @@ def main():
             if not askYesNo('\nEdit search selection?'): break
             editSubjectList()
 
-        if askYesNo('Search classes by date?'):
+        if whatToDo == 1:
             while True:
                 try:
                     startDate = dateFromISOFormat(input("Search from what date? YYYY-MM-DD: "))
@@ -213,15 +220,14 @@ def main():
                     print('Searching classes from {} ({}) to {} ({}).'.format(startTimetableID, startDate.isoformat(), endTimetableID, endDate.isoformat()))
                     futures = [executor.submit(fetchETree, startTimetableID+x) for x in range(endTimetableID-startTimetableID+1)]
                     break
-        else:
-            print('\nManual timetable_id range input.')
+        elif whatToDo == 2:
             while True:
                 try:
                     startTimetableID = int(input('Define beginning of timetable_id range: '))
                     endTimetableID = int(input('Define end of timetable_id range: '))
                     break
                 except ValueError:
-                    print('Invalid input.')
+                    print('Invalid input.\n')
             startTime = time.time()
             futures = [executor.submit(fetchETree, startTimetableID+x) for x in range(endTimetableID-startTimetableID+1)]
 
