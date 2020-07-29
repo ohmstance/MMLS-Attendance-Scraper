@@ -1,21 +1,25 @@
 from urllib import request, error, parse
 from lxml import etree
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 import concurrent.futures
 import time
 import getpass
+import json
 
 baseAttendanceURL = 'https://mmls.mmu.edu.my/attendance'
 baseAttendanceListURL = 'https://mmls.mmu.edu.my/viewAttendance'
 mmlsLoginURL = 'https://mmls.mmu.edu.my/checklogin?' #stud_id, stud_pswrd, _token. POST
 mmlsAttendanceLoginURL= 'https://mmls.mmu.edu.my/attendancelogin?' #stud_id, stud_pswrd, timetable_id, starttime, endtime, class_date, class_id, _token. POST.
-mmlsURL = 'https://mmls.mmu.edu.my/' #^^^Need Referer header: any attendance link.
+mmlsURL = 'https://mmls.mmu.edu.my/'                               #^^^Need Referer header: any attendance link.
 mmlsClassListURL = 'https://mmls.mmu.edu.my/studentlist'
 mmlsLogoutURL = 'https://mmls.mmu.edu.my/logout' #headers: cookie. GET
+mobileLoginURL = 'https://mmumobileapps.mmu.edu.my/api/auth/login2' #username, password. POST
+mobileSubjectListURL = 'https://mmumobileapps.mmu.edu.my/api/mmls/subject?' #token. GET
 maxTimetableID = 99999
 minTimetableID = 1
 workers = 64
 subjectListDB = []
+semStartDate = None
 
 def getURL(url, *, data={}, headers={}): #Sends GET request, returns HTTP response.
     data = parse.urlencode(data)
@@ -29,7 +33,7 @@ def postURL(url, *, data=None, headers={}): #Sends POST request, returns HTTP re
 
 def getAttendanceTree(timetableID): #Accepts timetable_id. Parses attendance HTTP response of input timetable_id. Returns ElementTree object, but None type if failed.
     try:
-        html = request.urlopen(baseAttendanceURL+':0:0:'+str(timetableID), timeout=45)
+        html = request.urlopen(baseAttendanceURL+':0:0:'+str(timetableID), timeout=20)
         tree = etree.parse(html, etree.HTMLParser())
         return tree
     except error.HTTPError as err:
@@ -91,7 +95,7 @@ def editSubjectList(): #User interface for making class search selection in Subj
     except (ValueError, IndexError):
         print('Invalid input.')
 
-def dateFromISOFormat(ISODateString): #Same as date.fromisoformat for use in Python versions prior 3.7
+def dateFromISOFormat(ISODateString): #Similar to date.fromisoformat for use in Python versions prior 3.7
     dateList = ISODateString.split('-')
     if len(dateList[0]) != 4 or len(dateList[1]) != 2 or len(dateList[2]) != 2:
         raise ValueError("Invalid isoformat string: '{}'".format(ISODateString))
@@ -123,15 +127,17 @@ def getMMLSCookieToken(): #I put this in fuction for async execution as this tas
 
 def main():
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
-        global subjectListDB
+        global subjectListDB, semStartDate
         futures = executor.submit(getMMLSCookieToken)
 
         print('-------------------------------')
         print('|   MMLS Attendance Scraper   |')
         print('-------------------------------')
         print('\nHow do you want to scrape attendance links?:')
-        print('1. Retrieve classes via MMLS login and search by date. (Inaccurrate in the first week and in edge cases)')
+        print('1. Retrieve classes via MMLS login and search by date.*')
         print('2. Retrieve classes via MMLS login and search by range of timetable_id.')
+        print('\n*/ Unreliable in the first three trimester days and in some cases. ')
+        print(' / If no links were caught use the second option instead.          ')
         while True:
             try:
                 whatToDo = int(input('\nChoice: '))
@@ -170,8 +176,21 @@ def main():
         futures = [executor.submit(parseClasses, subject, cookie) for subject in subjectListDB]
         for subjectNo, classes in enumerate(futures):
             subjectListDB[subjectNo]['classes'] = classes.result()
-        print('Parsed classes in subjects in {:.3f}s.\n'.format(time.time()-startTime))
+        print('Parsed classes in subjects in {:.3f}s.'.format(time.time()-startTime))
 
+        if whatToDo == 1:
+            startTime = time.time()
+            response = postURL(mobileLoginURL, data={'username' : userid, 'password' : password})
+            mobileToken = json.loads(response.read())['token']
+            print('Logged into MMU Mobile in {:.3f}s.'.format(time.time()-startTime))
+
+            startTime = time.time()
+            response = getURL(mobileSubjectListURL, data={'token' : mobileToken})
+            JSON = json.loads(response.read())
+            semStartDate = dateFromISOFormat(JSON[0]['sem_start_date'])
+            print('Parsed trimester start date in {:.3f}s.'.format(time.time()-startTime))
+
+        print('')
         printSubjectList()
         if askYesNo('\nAutofill?'):
             startTime = time.time()
@@ -191,8 +210,14 @@ def main():
         if whatToDo == 1:
             while True:
                 try:
-                    startDate = dateFromISOFormat(input("Search from what date? YYYY-MM-DD: "))
-                    endDate = dateFromISOFormat(input("Until what date? YYYY-MM-DD: "))
+                    startDate = input("Search from what date? YYYY-MM-DD: ")
+                    startDate = dateFromISOFormat(startDate) if startDate else (datetime.utcnow() + timedelta(hours=8)).date()
+                    startDate = semStartDate if (startDate - semStartDate).days < 0 else startDate
+                    if (startDate - semStartDate).days < 3:
+                        print("WARNING: Date search is extremely unreliable for searching the first three trimester days.")
+                        print("         Expect missing attendance links. Quit and use timetable_id range search instead.")
+                    endDate = input("Until what date? YYYY-MM-DD: ")
+                    endDate = dateFromISOFormat(endDate) if endDate else startDate
                     break
                 except (ValueError, IndexError):
                     print('Invalid format/input.\n')
