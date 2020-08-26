@@ -1,13 +1,13 @@
-from urllib import request, error, parse
-from lxml import etree
 from datetime import date, datetime, timedelta
+from io import StringIO
+from lxml import etree
+import asyncio
+import aiohttp
 import cmd
-import concurrent.futures
 import time
 import getpass
-import json
-import os
 
+asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 BASE_STUDENT_LIST_URL = 'https://mmls.mmu.edu.my/studentlist'
 MMLS_LOGIN_URL = 'https://mmls.mmu.edu.my/checklogin' #stud_id, stud_pswrd, _token. POST
 MMLS_ATTENDANCE_LOGIN_URL= 'https://mmls.mmu.edu.my/attendancelogin' #stud_id, stud_pswrd, timetable_id, starttime, endtime, class_date, class_id, _token. POST.
@@ -18,39 +18,28 @@ MOBILE_SUBJECT_LIST_URL = 'https://mmumobileapps.mmu.edu.my/api/mmls/subject' #t
 MOBILE_LOGOUT_URL = 'https://mmumobileapps.mmu.edu.my/api/logout' #token. GET
 BASE_ATTENDANCE_URL = 'https://mmls.mmu.edu.my/attendance'
 BASE_ATTENDANCE_LIST_URL = 'https://mmls.mmu.edu.my/viewAttendance'
-WORKERS = min(32, os.cpu_count()*5)
+MAX_CONCURRENT_REQUESTS = 6
 NETWORK_TIMEOUT = 15
 NETWORK_RETRIES = 3
 NETWORK_RETRY_BACKOFF = 2
 MAX_TIMETABLE_ID = 99999
 MIN_TIMETABLE_ID = 1
 
-def request_url(url, method='GET', *, data={}, headers={}):
-    if method == 'POST':
-        data = parse.urlencode(data).encode('utf-8')
-        req = request.Request(url, data=data, headers=headers, method='POST')
-    else: #defaults to GET
-        data = parse.urlencode(data)
-        req = request.Request(f"{url}?{data}", data=None, headers=headers, method='GET')
-    for _ in range(NETWORK_RETRIES):
-        try:
-            return request.urlopen(req, timeout=NETWORK_TIMEOUT)
-        except TimeoutError:
-            time.sleep(NETWORK_RETRY_BACKOFF)
-
-def get_attendance_etree(timetable_id): #Accepts timetable_id. Parses attendance HTTP response of input timetable_id. Returns ElementTree object, but None type if failed.
-    try:
-        html = request_url(f"{BASE_ATTENDANCE_URL}:0:0:{timetable_id}", 'GET')
-    except error.HTTPError as err:
-        if err.code == 500:
+async def get_attendance_etree(timetable_id, session, sem = None): #Accepts timetable_id. Parses attendance HTTP response of input timetable_id. Returns ElementTree object, but None type if failed.
+    if sem is None:
+        sem = asyncio.Semaphore()
+    async with sem:
+        response = await session.get(f"{BASE_ATTENDANCE_URL}:0:0:{timetable_id}")
+        if response.status == 500:
             return None
-    return etree.parse(html, etree.HTMLParser())
+        html = StringIO(await response.text())
+        return etree.parse(html, etree.HTMLParser())
 
-def date_to_timetable_id(date, option, upperbound = MAX_TIMETABLE_ID, lowerbound = MIN_TIMETABLE_ID):
-    class_date_xpath =  "//input[@name='class_date']/@value"
+async def date_to_timetable_id(date, option, session, *, upperbound = MAX_TIMETABLE_ID, lowerbound = MIN_TIMETABLE_ID):
+    class_date_xpath = "//input[@name='class_date']/@value"
     while(True): #Option: 1 for first occurence, -1 for last occurence; Binary search algorithm; Returns None if no class on that date.
         current_timetable_id = (upperbound+lowerbound)//2
-        html_etree = get_attendance_etree(current_timetable_id)
+        html_etree = await get_attendance_etree(current_timetable_id, session)
         if html_etree is None:
             upperbound = current_timetable_id-1
             continue
@@ -60,7 +49,7 @@ def date_to_timetable_id(date, option, upperbound = MAX_TIMETABLE_ID, lowerbound
         elif (date - current_date).days < 0:
             upperbound = current_timetable_id-1
         else:
-            look_ahead_etree = get_attendance_etree(current_timetable_id-option)
+            look_ahead_etree = await get_attendance_etree(current_timetable_id-option, session)
             if (look_ahead_etree is None or
                 date.fromisoformat(look_ahead_etree.xpath(class_date_xpath)[0]) != current_date):
                 return current_timetable_id
@@ -70,6 +59,30 @@ def date_to_timetable_id(date, option, upperbound = MAX_TIMETABLE_ID, lowerbound
                 lowerbound = current_timetable_id+1
         if upperbound < lowerbound:
             return None
+
+async def scrape(start_timetable_id, end_timetable_id):
+    async with aiohttp.ClientSession() as session:
+        tasks = []
+        sem = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
+        for timetable_id in range(start_timetable_id, end_timetable_id+1):
+            task = asyncio.create_task(get_attendance_etree(timetable_id, session, sem))
+            tasks.append(task)
+        found_attendance_link = False
+        while tasks:
+            html_etree = await tasks.pop(0)
+            if not html_etree:
+                for task in tasks:
+                    task.cancel()
+                del tasks
+                break
+            parsed_class_id = html_etree.xpath("//input[@name='class_id']/@value")[0]
+            if (subjects_db.is_class_in_database(parsed_class_id) and
+                subjects_db.is_class_selected(parsed_class_id)):
+                print()
+                print_links(html_etree)
+                found_attendance_link = True
+        if not found_attendance_link:
+            print('No links from selected classes found.')
 
 def print_subjects(subject_list):
     for subject_no, subject in enumerate(subject_list, 1):
@@ -104,84 +117,80 @@ class SubjectsDB:
     token = None
     mobile_token = None
 
-    def _request_url(self, url, method, *, data={}, headers={}):
-        if method == 'POST':
-            data = parse.urlencode(data).encode('utf-8')
-            req = request.Request(url, data=data, headers=headers, method='POST')
-        else: #defaults to GET
-            data = parse.urlencode(data)
-            req = request.Request(f"{url}?{data}", data=None, headers=headers, method='GET')
-        for _ in range(NETWORK_RETRIES):
-            try:
-                return request.urlopen(req, timeout=NETWORK_TIMEOUT)
-            except TimeoutError:
-                time.sleep(NETWORK_RETRY_BACKOFF)
-                continue
+    async def _parse_classes(self, subject, session, sem): #Accepts subject dict in SubjectListDB and cookie for MMLS. Returns a list of class dicts.
+        async with sem:
+            subject_id, coordinator_id = subject['subject_id'], subject['coordinator_id']
+            subject_student_list_url = f"{BASE_STUDENT_LIST_URL}:{subject_id}:{coordinator_id}:0"
+            response = await session.get(subject_student_list_url)
+            html = StringIO(await response.text())
+            tree = etree.parse(html, etree.HTMLParser())
+            class_names = tree.xpath("//select[@id='select_class']/*[not(self::option[@value='0'])]/text()")
+            class_ids = tree.xpath("//select[@id='select_class']/*[not(self::option[@value='0'])]/@value")
+            return [{'class_name' : name, 'class_id' : id, 'selected' : False} for name, id in zip(class_names, class_ids)]
 
-    def _parse_classes(self, subject): #Accepts subject dict in SubjectListDB and cookie for MMLS. Returns a list of class dicts.
-        subject_id, coordinator_id = subject['subject_id'], subject['coordinator_id']
-        subject_student_list_url = f"{BASE_STUDENT_LIST_URL}:{subject_id}:{coordinator_id}:0"
-        response = self._request_url(subject_student_list_url, 'GET', headers={'Cookie' : self.cookie})
-        tree = etree.parse(response, etree.HTMLParser())
-        class_names = tree.xpath("//select[@id='select_class']/*[not(self::option[@value='0'])]/text()")
-        class_ids = tree.xpath("//select[@id='select_class']/*[not(self::option[@value='0'])]/@value")
-        return [{'class_name' : name, 'class_id' : id, 'selected' : False} for name, id in zip(class_names, class_ids)]
+    async def _is_user_in_class(self, user_id, class_id, sem): #Returns True if user in class, False otherwise.
+        async with sem:
+            async with aiohttp.request('GET', 'https://mmls.mmu.edu.my/attendance:0:0:1') as response:
+                cookie = response.cookies
+            data = {'class_id' : class_id, 'stud_id' : user_id, 'stud_pswrd' : '0'}
+            headers = {'Referer' : 'https://mmls.mmu.edu.my/attendance:0:0:1'}
+            async with aiohttp.request('POST', MMLS_ATTENDANCE_LOGIN_URL, data=data, headers=headers, cookies=cookie) as response:
+                html = StringIO(await response.text())
+            tree = etree.parse(html, etree.HTMLParser())
+            not_in_class = tree.xpath("//div[@class='alert alert-danger']/text()='You are not register to this class.'")
+            return False if not_in_class else True
 
-    def _is_user_in_class(self, user_id, class_id): #Returns True if user in class, False otherwise.
-        cookie = request.urlopen('https://mmls.mmu.edu.my/attendance:0:0:1').info()['Set-Cookie']
-        data = {'stud_id' : user_id, 'stud_pswrd' : '0', 'class_id' : class_id}
-        headers = {'Cookie' : cookie, 'Referer' : 'https://mmls.mmu.edu.my/attendance:0:0:1'}
-        response = self._request_url(MMLS_ATTENDANCE_LOGIN_URL, 'POST', data=data, headers=headers)
-        tree = etree.parse(response, etree.HTMLParser())
-        not_in_class = tree.xpath("//div[@class='alert alert-danger']/text()='You are not register to this class.'")
-        return False if not_in_class else True
+    async def init_mmls(self):
+        async with aiohttp.ClientSession() as session:
+            response = await session.get(MMLS_URL)
+            html = StringIO(await response.text())
+            tree = etree.parse(html, etree.HTMLParser())
+            self.cookie = response.cookies
+            self.token = tree.xpath("//input[@name='_token']/@value")[0]
 
-    def init_mmls(self):
-        response = request.urlopen(MMLS_URL)
-        tree = etree.parse(response, etree.HTMLParser())
-        self.cookie = response.info()['Set-Cookie']
-        self.token = tree.xpath("//input[@name='_token']/@value")[0]
-
-    def login(self, user_id, password):
-        if not (self.token or self.cookie):
-            self.init_mmls()
-        data = {'stud_id' : user_id, 'stud_pswrd' : password, '_token' : self.token}
-        headers = {'Cookie' : self.cookie}
-        try:
-            response = self._request_url(MMLS_LOGIN_URL, 'POST', data=data, headers=headers)
-        except error.HTTPError as err:
-            if err.code == 500:
+    async def login(self, user_id, password):
+        if not self.token or not self.cookie:
+            await self.init_mmls()
+        async with aiohttp.ClientSession(cookies=self.cookie) as session:
+            data = {'stud_id' : user_id, 'stud_pswrd' : password, '_token' : self.token}
+            response = await session.post(MMLS_LOGIN_URL, data=data)
+            if response.status == 500:
                 return False
-        self.user_id = user_id
-        self.load_subjects(response)
-        return True
+            self.user_id = user_id
+            await self.load_subjects(response, session)
+            return True
 
-    def login_mobile(self, user_id, password):
-        data = {'username' : user_id, 'password' : password}
-        try:
-            response = self._request_url(MOBILE_LOGIN_URL, 'POST', data=data)
-        except error.HTTPError as err:
-            if err.code == 422:
+    async def login_mobile(self, user_id, password):
+        async with aiohttp.ClientSession() as session:
+            data = {'username' : user_id, 'password' : password}
+            response = await session.post(MOBILE_LOGIN_URL, data=data)
+            if response.status == 422:
                 return False
-        self.mobile_token = json.loads(response.read())['token']
-        self.first_trimester_date()
-        return True
-
-    def logout(self):
-        if self.cookie is not None:
-            headers = {'Cookie' : self.cookie}
-            self._request_url(MMLS_LOGOUT_URL, 'GET', headers=headers)
-
-    def logout_mobile(self):
-        if self.mobile_token is not None:
+            JSON = await response.json()
+            self.mobile_token = JSON['token']
             data = {'token' : self.mobile_token}
-            self._request_url(MOBILE_LOGOUT_URL, 'POST', data=data)
+            response = await session.get(MOBILE_SUBJECT_LIST_URL, params=data)
+            JSON = await response.json()
+            self.trimester_start_date = date.fromisoformat(JSON[0]['sem_start_date']) #Get sem_start_date of the first subject in MMU Mobile subject list
+        return True
 
-    def load_subjects(self, response = None):
-        if not response:
-            headers = {'Cookie' : self.cookie}
-            response = self._request_url(f"{MMLS_URL}home", 'GET', headers=headers)
-        tree = etree.parse(response, etree.HTMLParser())
+    async def logout(self):
+        if self.cookie is not None:
+            async with aiohttp.ClientSession(cookies=self.cookie) as session:
+                await session.post(MMLS_LOGOUT_URL)
+
+    async def logout_mobile(self):
+        if self.mobile_token is not None:
+            async with aiohttp.ClientSession() as session:
+                data = {'token' : self.mobile_token}
+                await session.post(MOBILE_LOGOUT_URL, data=data)
+
+    async def load_subjects(self, response = None, session = None):
+        if not response or not session:
+            session = aiohttp.ClientSession(cookies=self.cookie)
+            response = session.get(f"{MMLS_URL}home")
+        html = StringIO(await response.text())
+        tree = etree.parse(html, etree.HTMLParser())
         names = tree.xpath("//div[@class='list-group ' and @style='margin-top:-15px']/span/a[1]/text()")
         names = [name.split(' - ') for name in names] # ECE2056 - DATA COMM AND NEWORK
         links = tree.xpath("//div[@class='list-group ' and @style='margin-top:-15px']/span/a[1]/@href")
@@ -194,10 +203,10 @@ class SubjectsDB:
             'coordinator_id': coordinator_id, #Eg. 1585369691
             'classes' : [] #List of classes in dict, with its class code and select attribute.
         } for subject_code, subject_name, subject_id, coordinator_id in names_and_links]
-        with concurrent.futures.ThreadPoolExecutor(max_workers=WORKERS) as executor:
-            futures = [executor.submit(self._parse_classes, subject) for subject in temp_subjects_list]
-            for subject_index, classes in enumerate(futures):
-                temp_subjects_list[subject_index]['classes'] = classes.result()
+        sem = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
+        tasks = [asyncio.create_task(self._parse_classes(subject, session, sem)) for subject in temp_subjects_list]
+        for subject_index, classes in enumerate(tasks):
+            temp_subjects_list[subject_index]['classes'] = await classes
         for subject_index, subject in enumerate(self.subjects_db):
             for temp_subject_index, temp_subject in enumerate(temp_subjects_list):
                 if temp_subject['subject_id'] == subject['subject_id']:
@@ -206,18 +215,21 @@ class SubjectsDB:
         self.subjects_db.extend(temp_subjects_list)
         self.update_hash()
 
-    def autoselect_classes(self):
+    async def autoselect_classes(self):
         if self.registered_classes:
             for class_id in self.registered_classes:
                 self.get_class(class_id).update({'selected': True})
             return True
         elif self.user_id is not None:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=WORKERS) as executor:
-                futures = [[class_id, executor.submit(self._is_user_in_class, self.user_id, class_id)] for class_id in self.class_id_to_index_dict.keys()]
-                for class_id, is_in_class in futures:
-                    if is_in_class.result():
-                        self.get_class(class_id).update({'selected': True})
-                        self.registered_classes.add(class_id)
+            sem = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
+            tasks = []
+            for class_id in self.class_id_to_index_dict.keys():
+                task = asyncio.create_task(self._is_user_in_class(self.user_id, class_id, sem))
+                tasks.append([class_id, task])
+            for class_id, is_in_class in tasks:
+                if await is_in_class:
+                    self.get_class(class_id).update({'selected': True})
+                    self.registered_classes.add(class_id)
             return True
         else:
             return False
@@ -269,15 +281,6 @@ class SubjectsDB:
     def is_any_class_selected(self):
         return next((True for subject in self.subjects_db for s_class in subject['classes'] if s_class['selected']), False)
 
-    def first_trimester_date(self):
-        if self.trimester_start_date:
-            return self.trimester_start_date
-        data = {'token' : self.mobile_token}
-        response = self._request_url(MOBILE_SUBJECT_LIST_URL, 'GET', data=data)
-        JSON = json.loads(response.read())
-        self.trimester_start_date = date.fromisoformat(JSON[0]['sem_start_date']) #Get sem_start_date of the first subject in MMU Mobile subject list
-        return self.trimester_start_date
-
 class Prompt(cmd.Cmd):
     nohelp = "No help on '%s'.\n"
 
@@ -286,10 +289,16 @@ class Prompt(cmd.Cmd):
         "Log in to MMLS and MMU Mobile and load subjects and classes.\n"
         "————————————————————————————————————————————————————————————\n"
         "Syntax:   login [student_id]                                \n")
+        async def login_all(user_id, password):
+            mobile_task = asyncio.create_task(subjects_db.login_mobile(user_id, password))
+            mmls_task = asyncio.create_task(subjects_db.login(user_id, password))
+            if not await mobile_task:
+                return False
+            await mmls_task
+            return True
         user_id = args.split()[0] if args else input('Student ID: ')
         password = getpass.getpass()
-        if subjects_db.login(user_id, password):
-            subjects_db.login_mobile(user_id, password)
+        if asyncio.run(login_all(user_id, password)):
             print('Success.\n')
         else:
             print('Wrong student ID or password.\n')
@@ -301,7 +310,7 @@ class Prompt(cmd.Cmd):
 
     def do_autoselect(self, args):
         ("\nAuto-select classes that the student has registered for.\n")
-        if subjects_db.autoselect_classes():
+        if asyncio.run(subjects_db.autoselect_classes()):
             print_subjects(subjects_db.subjects_db)
             print()
         else:
@@ -357,92 +366,74 @@ class Prompt(cmd.Cmd):
         cmd = ''.join(args.split()[:1])
         args = ' '.join(args.split()[1:])
         if not subjects_db.is_any_class_selected():
-            print('No classes selected for searching.\n')
-            return
-        with concurrent.futures.ThreadPoolExecutor(max_workers=WORKERS) as executor:
-            if not cmd or not (cmd == 'date' or cmd == 'timetable'):
-                print("Invalid command. Enter 'help search' for command help.\n")
+            print('No classes selected for searching.')
+        elif not cmd or not (cmd == 'date' or cmd == 'timetable'):
+            print("Invalid command. Enter 'help search' for command help.")
+        # =============== search date <start_date> <end_date> ===============
+        elif cmd == 'date':
+            args_list = args.split()
+            try:
+                if len(args_list) > 2:
+                    print("Too many arguments. Enter 'help search' for command help.\n")
+                    return
+                elif len(args_list) == 1:
+                    start_date = end_date = date.fromisoformat(args_list[0])
+                elif len(args_list) == 0:
+                    start_date = end_date = (datetime.utcnow()+timedelta(hours=8)).date()
+                else:
+                    start_date = date.fromisoformat(args_list[0])
+                    end_date = date.fromisoformat(args_list[1])
+            except ValueError as err:
+                print(f"{err}. Use format YYYY-MM-DD.\n")
                 return
-            # =============== search date <start_date> <end_date> ===============
-            elif cmd == 'date':
-                args_list = args.split()
-                try:
-                    if len(args_list) > 2:
-                        print("Too many arguments. Enter 'help search' for command help.\n")
-                        return
-                    elif len(args_list) == 1:
-                        start_date = end_date = date.fromisoformat(args_list[0])
-                    elif len(args_list) == 0:
-                        start_date = end_date = (datetime.utcnow()+timedelta(hours=8)).date()
-                    else:
-                        start_date = date.fromisoformat(args_list[0])
-                        end_date = date.fromisoformat(args_list[1])
-                except ValueError as err:
-                    print(f"{err}. Use format YYYY-MM-DD.\n")
-                    return
-                trimester_start_date = subjects_db.first_trimester_date()
-                if 0 <= (start_date - trimester_start_date).days <= 2 or 0 <= (start_date - trimester_start_date).days <= 2:
-                    print("WARNING: Date search is extremely unreliable in the first three trimester days.\n"
-                          "         Expect missing or no attendance links. Use timetable search instead!")
-                start_timetable_id = end_timetable_id = None
-                while True:
-                    if start_timetable_id is None:
-                        start_timetable_id = executor.submit(date_to_timetable_id, start_date, 1)
-                    if end_timetable_id is None:
-                        end_timetable_id = executor.submit(date_to_timetable_id, end_date, -1)
-                    start_timetable_id = start_timetable_id if isinstance(start_timetable_id, int) else start_timetable_id.result()
-                    end_timetable_id = end_timetable_id if isinstance(end_timetable_id, int) else end_timetable_id.result()
-                    if not start_timetable_id:
-                        start_date += timedelta(days=1)
-                    if not end_timetable_id:
-                        end_date -= timedelta(days=1)
-                    if start_date > end_date:
-                        print('No classes found within date range.\n')
-                        return
-                    elif start_timetable_id and end_timetable_id:
-                        print(f"Searching classes from {start_timetable_id} ({start_date.isoformat()}) to {end_timetable_id} ({end_date.isoformat()}).")
-                        timetable_id_range = end_timetable_id-start_timetable_id+1
-                        futures = [executor.submit(get_attendance_etree, start_timetable_id+x) for x in range(timetable_id_range)]
-                        break
-            # =============== search timetable <start_id> <end_id> ===============
-            elif cmd == 'timetable':
-                args_list = args.split()
-                if not len(args_list) == 2:
-                    print("Expected two arguments. Enter 'help search' for command help.\n")
-                    return
-                try:
-                    start_timetable_id = int(args_list[0])
-                    end_timetable_id = int(args_list[1])
-                except ValueError as err:
-                    print(f"Value error. Enter 'help search' for command help.\n")
-                    return
-                print(f"Searching classes from {start_timetable_id} to {end_timetable_id}.")
-                timetable_id_range = end_timetable_id-start_timetable_id+1
-                futures = [executor.submit(get_attendance_etree, start_timetable_id+x) for x in range(timetable_id_range)]
-            # =============== Parsing and printing ===============
-            found_attendance_link = False
-            while futures:
-                html_etree = futures.pop(0).result()
-                if not html_etree:
-                    for future in futures:
-                        concurrent.futures.Future.cancel(future)
-                    del futures
-                    break
-                parsed_class_id = html_etree.xpath("//input[@name='class_id']/@value")[0]
-                if (subjects_db.is_class_in_database(parsed_class_id) and
-                    subjects_db.is_class_selected(parsed_class_id)):
-                    print()
-                    print_links(html_etree)
-                    found_attendance_link = True
-            if not found_attendance_link:
-                print('No links from selected classes found.')
+            tri_start_date = subjects_db.trimester_start_date
+            if tri_start_date is not None and (0 <= (start_date - tri_start_date).days <= 2 or 0 <= (start_date - tri_start_date).days <= 2):
+                print("WARNING: Date search is extremely unreliable in the first three trimester days.\n"
+                      "         Expect missing or no attendance links. Use timetable search instead!")
+            async def scrape_date(start_date, end_date):
+                async with aiohttp.ClientSession() as session:
+                    start_timetable_id = end_timetable_id = None
+                    while True:
+                        if start_timetable_id is None:
+                            start_ttid_task = asyncio.create_task(date_to_timetable_id(start_date, 1, session))
+                        if end_timetable_id is None:
+                            end_ttid_task = asyncio.create_task(date_to_timetable_id(end_date, -1, session))
+                        start_timetable_id = await start_ttid_task
+                        end_timetable_id = await end_ttid_task
+                        if not start_timetable_id:
+                            start_date += timedelta(days=1)
+                        if not end_timetable_id:
+                            end_date -= timedelta(days=1)
+                        if start_date > end_date:
+                            print('No classes found within date range.')
+                            break
+                        elif start_timetable_id and end_timetable_id:
+                            print(f"Searching classes from {start_timetable_id} ({start_date.isoformat()}) to {end_timetable_id} ({end_date.isoformat()}).")
+                            await scrape(start_timetable_id, end_timetable_id)
+                            break
+            asyncio.run(scrape_date(start_date, end_date))
+        # =============== search timetable <start_id> <end_id> ===============
+        elif cmd == 'timetable':
+            args_list = args.split()
+            if not len(args_list) == 2:
+                print("Expected two arguments. Enter 'help search' for command help.\n")
+                return
+            try:
+                start_timetable_id = int(args_list[0])
+                end_timetable_id = int(args_list[1])
+            except ValueError as err:
+                print(f"Value error. Enter 'help search' for command help.\n")
+                return
+            print(f"Searching classes from {start_timetable_id} to {end_timetable_id}.")
+            asyncio.run(scrape(start_timetable_id, end_timetable_id))
         print()
 
     def do_exit(self, args):
         ("\nLog out both MMLS and MMU Mobile then terminate this script.\n")
         print('Exiting.')
-        subjects_db.logout()
-        subjects_db.logout_mobile()
+        async def logout_all():
+            asyncio.gather(subjects_db.logout(), subjects_db.logout_mobile(), return_exceptions=True)
+        asyncio.run(logout_all())
         exit()
 
     def change_selection(self, args, op):
@@ -481,16 +472,6 @@ class Prompt(cmd.Cmd):
                     for class_index in class_set:
                         subjects_db.selector(op, subject_index, class_index)
         return True
-
-    # def parse_flag_args(self, args): #TODO: Need better implementation for no-argument flags
-    #     args_list = args.lower().split()
-    #     args_dict = {}
-    #     prev_arg = ''
-    #     for arg in args_list:
-    #         if prev_arg[:1] == '-' and arg[:1] != '-':
-    #             args_dict[prev_arg[1:]] = arg
-    #         prev_arg = arg
-    #     return args_dict
 
     def default(self, line):
         print(f"Command not found: '{line}'. Enter 'help' to list commands.\n")
