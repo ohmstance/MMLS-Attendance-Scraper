@@ -6,8 +6,8 @@ import aiohttp
 import cmd
 import time
 import getpass
+import os
 
-asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 BASE_STUDENT_LIST_URL = 'https://mmls.mmu.edu.my/studentlist'
 MMLS_LOGIN_URL = 'https://mmls.mmu.edu.my/checklogin' #stud_id, stud_pswrd, _token. POST
 MMLS_ATTENDANCE_LOGIN_URL= 'https://mmls.mmu.edu.my/attendancelogin' #stud_id, stud_pswrd, timetable_id, starttime, endtime, class_date, class_id, _token. POST.
@@ -487,6 +487,9 @@ class Prompt(cmd.Cmd):
         "Arguments in...                      \n"
         "    1. Angle brackets is <required>  \n"
         "    2. Square brackets is [optional] \n")
+
+if os.name == 'nt':
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 if __name__ == '__main__':
     subjects_db = SubjectsDB()
