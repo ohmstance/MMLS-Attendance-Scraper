@@ -20,4 +20,4 @@ Although the subject ID and the coordinator ID is obtainable via MMLS in its HTM
 
 ### Addendum
 https://github.com/ToraNova/sleep-in  
-ToraNova created an aptly named 'sleep-in' back in the end of 2018 probably as an assignment. Well, until now, this vulnerability still isn't fixed. That was written in Java and differs to this in that the program bruteforces sign-ins through attendance links in range of timetable_id. However, it's slow as it is not concurrent.
+ToraNova created an aptly named 'sleep-in' back in the end of 2018 probably as an assignment. Well, until now, this vulnerability still isn't fixed. That was written in Java and differs to this in that the program bruteforces sign-ins through attendance links in range of timetable_id. However, as it is not concurrent, it takes a while.
