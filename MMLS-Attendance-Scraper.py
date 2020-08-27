@@ -1,12 +1,13 @@
 from datetime import date, datetime, timedelta
 from io import StringIO
 from lxml import etree
-import asyncio
 import aiohttp
+import asyncio
 import cmd
-import time
 import getpass
 import os
+import re
+import time
 
 BASE_STUDENT_LIST_URL = 'https://mmls.mmu.edu.my/studentlist'
 MMLS_LOGIN_URL = 'https://mmls.mmu.edu.my/checklogin' #stud_id, stud_pswrd, _token. POST
@@ -18,32 +19,45 @@ MOBILE_SUBJECT_LIST_URL = 'https://mmumobileapps.mmu.edu.my/api/mmls/subject' #t
 MOBILE_LOGOUT_URL = 'https://mmumobileapps.mmu.edu.my/api/logout' #token. GET
 BASE_ATTENDANCE_URL = 'https://mmls.mmu.edu.my/attendance'
 BASE_ATTENDANCE_LIST_URL = 'https://mmls.mmu.edu.my/viewAttendance'
-MAX_CONCURRENT_REQUESTS = 6
+MAX_CONCURRENT_REQUESTS = 6 #Max value: 64 on Windows due to 'Windows selector() API limitations'
 NETWORK_TIMEOUT = 15
 NETWORK_RETRIES = 3
-NETWORK_RETRY_BACKOFF = 2
+NETWORK_RETRY_BACKOFF = 3
 MAX_TIMETABLE_ID = 99999
 MIN_TIMETABLE_ID = 1
+PRINT_ATTENDANCE_LIST = False
+TIME_IT = False #Times network-dependent tasks. Timed: Login, autoselect, and search.
 
-async def get_attendance_etree(timetable_id, session, sem = None): #Accepts timetable_id. Parses attendance HTTP response of input timetable_id. Returns ElementTree object, but None type if failed.
-    if sem is None:
-        sem = asyncio.Semaphore()
+async def request(method, url, session=None, *, data=None, params=None, headers=None, cookies=None):
+    timeout = aiohttp.ClientTimeout(total=NETWORK_TIMEOUT)
+    if session is None:
+        session = aiohttp.ClientSession()
+    for _ in range(NETWORK_RETRIES):
+        try:
+            return await session.request(method, url, data=data, params=params, headers=headers, cookies=cookies, timeout=timeout)
+        except asyncio.TimeoutError:
+            await asyncio.sleep(NETWORK_RETRY_BACKOFF)
+    return await session.request(method, url, data=data, params=params, headers=headers, cookies=cookies, timeout=timeout)
+
+async def get_attendance_etree(timetable_id, session, sem = None):
+    if sem is None: #Accepts timetable_id. Parses attendance HTTP response of input timetable_id. Returns ElementTree object, but None type if failed.
+        sem = asyncio.Semaphore(1)
     async with sem:
-        response = await session.get(f"{BASE_ATTENDANCE_URL}:0:0:{timetable_id}")
+        response = await request('GET', f"{BASE_ATTENDANCE_URL}:0:0:{timetable_id}", session)
         if response.status == 500:
             return None
         html = StringIO(await response.text())
         return etree.parse(html, etree.HTMLParser())
 
 async def date_to_timetable_id(date, option, session, *, upperbound = MAX_TIMETABLE_ID, lowerbound = MIN_TIMETABLE_ID):
-    class_date_xpath = "//input[@name='class_date']/@value"
+    CLASS_DATE_XPATH = "//input[@name='class_date']/@value"
     while(True): #Option: 1 for first occurence, -1 for last occurence; Binary search algorithm; Returns None if no class on that date.
         current_timetable_id = (upperbound+lowerbound)//2
         html_etree = await get_attendance_etree(current_timetable_id, session)
         if html_etree is None:
             upperbound = current_timetable_id-1
             continue
-        current_date = date.fromisoformat(html_etree.xpath(class_date_xpath)[0])
+        current_date = date.fromisoformat(html_etree.xpath(CLASS_DATE_XPATH)[0])
         if (date - current_date).days > 0:
             lowerbound = current_timetable_id+1
         elif (date - current_date).days < 0:
@@ -51,7 +65,7 @@ async def date_to_timetable_id(date, option, session, *, upperbound = MAX_TIMETA
         else:
             look_ahead_etree = await get_attendance_etree(current_timetable_id-option, session)
             if (look_ahead_etree is None or
-                date.fromisoformat(look_ahead_etree.xpath(class_date_xpath)[0]) != current_date):
+                date.fromisoformat(look_ahead_etree.xpath(CLASS_DATE_XPATH)[0]) != current_date):
                 return current_timetable_id
             if option == 1:
                 upperbound = current_timetable_id-1
@@ -105,7 +119,8 @@ def print_links(html_etree):
     timetableid = html_etree.xpath("//input[@name='timetable_id']/@value")[0]
     print(f"[{date} {starttime}-{endtime}] {subjectcode} - {subjectname} ({classname})")
     print(f"{BASE_ATTENDANCE_URL}:{subjectid}:{coordinatorid}:{timetableid}") #subjectID and coor.ID don't matter for attendance links
-    print(f"{BASE_ATTENDANCE_LIST_URL}:{subjectid}:{coordinatorid}:{timetableid}:{classid}:1") #Attendance list links requires all IDs to be correct
+    if PRINT_ATTENDANCE_LIST:
+        print(f"{BASE_ATTENDANCE_LIST_URL}:{subjectid}:{coordinatorid}:{timetableid}:{classid}:1") #Attendance list links requires all IDs to be correct
 
 class SubjectsDB:
     subjects_db = []
@@ -117,32 +132,9 @@ class SubjectsDB:
     token = None
     mobile_token = None
 
-    async def _parse_classes(self, subject, session, sem): #Accepts subject dict in SubjectListDB and cookie for MMLS. Returns a list of class dicts.
-        async with sem:
-            subject_id, coordinator_id = subject['subject_id'], subject['coordinator_id']
-            subject_student_list_url = f"{BASE_STUDENT_LIST_URL}:{subject_id}:{coordinator_id}:0"
-            response = await session.get(subject_student_list_url)
-            html = StringIO(await response.text())
-            tree = etree.parse(html, etree.HTMLParser())
-            class_names = tree.xpath("//select[@id='select_class']/*[not(self::option[@value='0'])]/text()")
-            class_ids = tree.xpath("//select[@id='select_class']/*[not(self::option[@value='0'])]/@value")
-            return [{'class_name' : name, 'class_id' : id, 'selected' : False} for name, id in zip(class_names, class_ids)]
-
-    async def _is_user_in_class(self, user_id, class_id, sem): #Returns True if user in class, False otherwise.
-        async with sem:
-            async with aiohttp.request('GET', 'https://mmls.mmu.edu.my/attendance:0:0:1') as response:
-                cookie = response.cookies
-            data = {'class_id' : class_id, 'stud_id' : user_id, 'stud_pswrd' : '0'}
-            headers = {'Referer' : 'https://mmls.mmu.edu.my/attendance:0:0:1'}
-            async with aiohttp.request('POST', MMLS_ATTENDANCE_LOGIN_URL, data=data, headers=headers, cookies=cookie) as response:
-                html = StringIO(await response.text())
-            tree = etree.parse(html, etree.HTMLParser())
-            not_in_class = tree.xpath("//div[@class='alert alert-danger']/text()='You are not register to this class.'")
-            return False if not_in_class else True
-
     async def init_mmls(self):
         async with aiohttp.ClientSession() as session:
-            response = await session.get(MMLS_URL)
+            response = await request('GET', MMLS_URL, session)
             html = StringIO(await response.text())
             tree = etree.parse(html, etree.HTMLParser())
             self.cookie = response.cookies
@@ -151,9 +143,9 @@ class SubjectsDB:
     async def login(self, user_id, password):
         if not self.token or not self.cookie:
             await self.init_mmls()
-        async with aiohttp.ClientSession(cookies=self.cookie) as session:
+        async with aiohttp.ClientSession(cookies=self.cookie, ) as session:
             data = {'stud_id' : user_id, 'stud_pswrd' : password, '_token' : self.token}
-            response = await session.post(MMLS_LOGIN_URL, data=data)
+            response = await request('POST', MMLS_LOGIN_URL, session, data=data)
             if response.status == 500:
                 return False
             self.user_id = user_id
@@ -163,38 +155,37 @@ class SubjectsDB:
     async def login_mobile(self, user_id, password):
         async with aiohttp.ClientSession() as session:
             data = {'username' : user_id, 'password' : password}
-            response = await session.post(MOBILE_LOGIN_URL, data=data)
-            if response.status == 422:
+            response = await request('POST', MOBILE_LOGIN_URL, session, data=data)
+            if response.status == 422 or response.status == 500:
                 return False
             JSON = await response.json()
             self.mobile_token = JSON['token']
-            data = {'token' : self.mobile_token}
-            response = await session.get(MOBILE_SUBJECT_LIST_URL, params=data)
+            params = {'token' : self.mobile_token}
+            response = await request('GET', MOBILE_SUBJECT_LIST_URL, session, params=params)
             JSON = await response.json()
             self.trimester_start_date = date.fromisoformat(JSON[0]['sem_start_date']) #Get sem_start_date of the first subject in MMU Mobile subject list
         return True
 
     async def logout(self):
         if self.cookie is not None:
-            async with aiohttp.ClientSession(cookies=self.cookie) as session:
-                await session.post(MMLS_LOGOUT_URL)
+            async with aiohttp.ClientSession(cookies=self.cookie, ) as session:
+                await request('GET', MMLS_LOGOUT_URL, session)
 
     async def logout_mobile(self):
         if self.mobile_token is not None:
             async with aiohttp.ClientSession() as session:
                 data = {'token' : self.mobile_token}
-                await session.post(MOBILE_LOGOUT_URL, data=data)
+                await request('POST', MOBILE_LOGOUT_URL, session, data=data)
 
     async def load_subjects(self, response = None, session = None):
         if not response or not session:
-            session = aiohttp.ClientSession(cookies=self.cookie)
-            response = session.get(f"{MMLS_URL}home")
+            session = aiohttp.ClientSession(cookies=self.cookie, )
+            response = request('GET', f"{MMLS_URL}home", session)
         html = StringIO(await response.text())
         tree = etree.parse(html, etree.HTMLParser())
-        names = tree.xpath("//div[@class='list-group ' and @style='margin-top:-15px']/span/a[1]/text()")
-        names = [name.split(' - ') for name in names] # ECE2056 - DATA COMM AND NEWORK
-        links = tree.xpath("//div[@class='list-group ' and @style='margin-top:-15px']/span/a[1]/@href")
-        links = [link[24:].split(':') for link in links] # https://mmls.mmu.edu.my/232:1592795134
+        SUBJECT_GROUP_XPATH = "//div[@class='list-group ' and @style='margin-top:-15px']/span/a[1]"
+        names = [name.split(' - ') for name in tree.xpath(f"{SUBJECT_GROUP_XPATH}/text()")] # ECE2056 - DATA COMM AND NEWORK
+        links = [link[24:].split(':') for link in tree.xpath(f"{SUBJECT_GROUP_XPATH}/@href")] # https://mmls.mmu.edu.my/232:1592795134
         names_and_links = [[data for nested_list in zipped for data in nested_list] for zipped in zip(names, links)]
         temp_subjects_list = [{
             'subject_code': subject_code, #Eg. ECE2056
@@ -203,8 +194,19 @@ class SubjectsDB:
             'coordinator_id': coordinator_id, #Eg. 1585369691
             'classes' : [] #List of classes in dict, with its class code and select attribute.
         } for subject_code, subject_name, subject_id, coordinator_id in names_and_links]
+        async def parse_classes(subject, session, sem):
+            async with sem: #Accepts subject dict in SubjectListDB and cookie for MMLS. Returns a list of class dicts.
+                subject_id, coordinator_id = subject['subject_id'], subject['coordinator_id']
+                subject_student_list_url = f"{BASE_STUDENT_LIST_URL}:{subject_id}:{coordinator_id}:0"
+                response = await request('GET', subject_student_list_url, session)
+                html = StringIO(await response.text())
+                tree = etree.parse(html, etree.HTMLParser())
+                GROUP_DROPDOWN_XPATH = "//select[@id='select_class']/*[not(self::option[@value='0'])]"
+                class_names = tree.xpath(f"{GROUP_DROPDOWN_XPATH}/text()")
+                class_ids = tree.xpath(f"{GROUP_DROPDOWN_XPATH}/@value")
+                return [{'class_name' : name, 'class_id' : id, 'selected' : False} for name, id in zip(class_names, class_ids)]
         sem = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
-        tasks = [asyncio.create_task(self._parse_classes(subject, session, sem)) for subject in temp_subjects_list]
+        tasks = [asyncio.create_task(parse_classes(subject, session, sem)) for subject in temp_subjects_list]
         for subject_index, classes in enumerate(tasks):
             temp_subjects_list[subject_index]['classes'] = await classes
         for subject_index, subject in enumerate(self.subjects_db):
@@ -216,18 +218,38 @@ class SubjectsDB:
         self.update_hash()
 
     async def autoselect_classes(self):
+        async def is_user_in_class(user_id, class_id_queue, result_list): #Returns True if user in class, False otherwise.
+            NOT_REGISTERED_XPATH = "//div[@class='alert alert-danger']/text()='You are not register to this class.'"
+            async with aiohttp.ClientSession() as session:
+                await request('GET', 'https://mmls.mmu.edu.my/attendance:0:0:1', session)
+                while True:
+                    class_id = await class_id_queue.get()
+                    data = {'class_id' : class_id, 'stud_id' : user_id, 'stud_pswrd' : '0'}
+                    headers = {'Referer' : 'https://mmls.mmu.edu.my/attendance:0:0:1'}
+                    response = await request('POST', MMLS_ATTENDANCE_LOGIN_URL, session, data=data, headers=headers)
+                    html = StringIO(await response.text())
+                    tree = etree.parse(html, etree.HTMLParser())
+                    result = (class_id, False) if tree.xpath(NOT_REGISTERED_XPATH) else (class_id, True)
+                    result_list.append(result)
+                    class_id_queue.task_done()
         if self.registered_classes:
             for class_id in self.registered_classes:
                 self.get_class(class_id).update({'selected': True})
             return True
         elif self.user_id is not None:
-            sem = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
-            tasks = []
+            class_id_queue = asyncio.Queue()
+            result_list = []
+            tasks = [asyncio.create_task(
+                    is_user_in_class(self.user_id, class_id_queue, result_list)
+                    ) for _ in range(MAX_CONCURRENT_REQUESTS)]
             for class_id in self.class_id_to_index_dict.keys():
-                task = asyncio.create_task(self._is_user_in_class(self.user_id, class_id, sem))
-                tasks.append([class_id, task])
-            for class_id, is_in_class in tasks:
-                if await is_in_class:
+                class_id_queue.put_nowait(class_id)
+            await class_id_queue.join()
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            for class_id, is_in_class in result_list:
+                if is_in_class:
                     self.get_class(class_id).update({'selected': True})
                     self.registered_classes.add(class_id)
             return True
@@ -298,10 +320,12 @@ class Prompt(cmd.Cmd):
             return True
         user_id = args.split()[0] if args else input('Student ID: ')
         password = getpass.getpass()
+        init_time = time.time()
         if asyncio.run(login_all(user_id, password)):
             print('Success.\n')
         else:
             print('Wrong student ID or password.\n')
+        print(f'Command took {time.time()-init_time:.2f}s\n\n' if TIME_IT else '', end='')
 
     def do_print(self, args):
         ("\nDisplay stored subjects, classes and selection.\n")
@@ -310,11 +334,13 @@ class Prompt(cmd.Cmd):
 
     def do_autoselect(self, args):
         ("\nAuto-select classes that the student has registered for.\n")
+        init_time = time.time()
         if asyncio.run(subjects_db.autoselect_classes()):
             print_subjects(subjects_db.subjects_db)
             print()
         else:
             print('Please log in to use this command.\n')
+        print(f'Command took {time.time()-init_time:.2f}s\n\n' if TIME_IT else '', end='')
 
     def do_select(self, args):
         ("\n"
@@ -352,6 +378,37 @@ class Prompt(cmd.Cmd):
         print_subjects(subjects_db.subjects_db)
         print()
 
+    def change_selection(self, args, op):
+        """Parses selection command arguments, creates a dict of sets -- where
+        key is subject index and value is a set of class index -- and iterates
+        through each item and its set elements which through it does select,
+        deselect or toggle operation to classes at their index."""
+        args_list = args.lower().split() # E.g. ['1ab', '2ac', '3', '4a']
+        if args_list and args_list[0] == 'all':
+            subjects_db.selector(op, None, None)
+        else:
+            op_dict = {} #op_dict = {subject_index: {class_index, ...}, ...}
+            for arg in args_list:
+                re_obj = re.match('[0-9]+', arg[0])
+                if re_obj is None:
+                    continue
+                subject_index = int(re_obj[0])-1
+                if subject_index < 0:
+                    continue
+                re_obj = re.search('[a-z]+', arg)
+                letters = re_obj[0] if re_obj is not None else ''
+                class_choices = [ord(char)-ord('a') for char in letters]
+                op_dict[subject_index] = set(class_choices)
+            if not op_dict:
+                return False
+            for subject_index, class_set in op_dict.items():
+                if not class_set:
+                    subjects_db.selector(op, subject_index, None)
+                else:
+                    for class_index in class_set:
+                        subjects_db.selector(op, subject_index, class_index)
+        return True
+
     def do_search(self, args):
         ("\n"
         "Search for attendance links in a specified range.\n"
@@ -387,7 +444,8 @@ class Prompt(cmd.Cmd):
                 print(f"{err}. Use format YYYY-MM-DD.\n")
                 return
             tri_start_date = subjects_db.trimester_start_date
-            if tri_start_date is not None and (0 <= (start_date - tri_start_date).days <= 2 or 0 <= (start_date - tri_start_date).days <= 2):
+            if (tri_start_date is not None and
+                (0 <= (start_date - tri_start_date).days <= 2 or 0 <= (start_date - tri_start_date).days <= 2)):
                 print("WARNING: Date search is extremely unreliable in the first three trimester days.\n"
                       "         Expect missing or no attendance links. Use timetable search instead!")
             async def scrape_date(start_date, end_date):
@@ -411,6 +469,7 @@ class Prompt(cmd.Cmd):
                             print(f"Searching classes from {start_timetable_id} ({start_date.isoformat()}) to {end_timetable_id} ({end_date.isoformat()}).")
                             await scrape(start_timetable_id, end_timetable_id)
                             break
+            init_time = time.time()
             asyncio.run(scrape_date(start_date, end_date))
         # =============== search timetable <start_id> <end_id> ===============
         elif cmd == 'timetable':
@@ -425,8 +484,9 @@ class Prompt(cmd.Cmd):
                 print(f"Value error. Enter 'help search' for command help.\n")
                 return
             print(f"Searching classes from {start_timetable_id} to {end_timetable_id}.")
+            init_time = time.time()
             asyncio.run(scrape(start_timetable_id, end_timetable_id))
-        print()
+        print(f'\nCommand took {time.time()-init_time:.2f}s\n\n' if TIME_IT else '\n', end='')
 
     def do_exit(self, args):
         ("\nLog out both MMLS and MMU Mobile then terminate this script.\n")
@@ -436,42 +496,56 @@ class Prompt(cmd.Cmd):
         asyncio.run(logout_all())
         exit()
 
-    def change_selection(self, args, op):
-        """Parses selection command arguments, creates a dict of sets -- where
-        key is subject index and value is a set of class index -- and iterates
-        through each item and its set elements which through it does select,
-        deselect or toggle operation to classes at their index."""
-        if args and args.lower().split()[0] == 'all':
-            subjects_db.selector(op, None, None)
-        else:
-            args_list = args.lower().split() # E.g. ['1ab', '2ac', '3', '4a']
-            op_dict = {} #op_dict = {subject_index: {class_index, ...}, ...}
-            match_int = {str(i) for i in range(10)}
-            for arg in args_list:
-                # ===== Get subject index =====
-                subject_no = ''
-                for char in arg:
-                    if char not in match_int:
-                        break
-                    subject_no += char
-                if len(subject_no) == 0:
-                    continue
-                # ===== Get class indexes =====
-                class_choices = [ord(char)-ord('a') for char in arg[len(subject_no):]]
-                for index, char_int in enumerate(class_choices):
-                    if char_int < 0 or char_int > ord('z')-ord('a'):
-                        class_choices = class_choices[:index+1]
-                        break
-                op_dict[int(subject_no)-1] = set(class_choices)
-            if not op_dict:
-                return False
-            for subject_index, class_set in op_dict.items():
-                if not class_set:
-                    subjects_db.selector(op, subject_index, None)
-                else:
-                    for class_index in class_set:
-                        subjects_db.selector(op, subject_index, class_index)
-        return True
+    def do_guided(self, args):
+        ("\nStart a guided setup for typical attendance scraping.\n")
+        def ask_yes_no(question):
+            while True:
+                decision = input(f"{question} (y/n): ")
+                if (decision.lower() == 'y'): return True
+                if (decision.lower() == 'n'): return False
+                print("Invalid input.")
+        print("How do you want to scrape attendance links?:                           \n"
+              "1. Retrieve classes via MMLS login and search by date.*                \n"
+              "2. Retrieve classes via MMLS login and search by range of timetable_id.\n\n"
+              "*/ Unreliable in the first three trimester days and in some cases.     \n"
+              " / If no links were caught use the second option instead.              ")
+        while True:
+            try:
+                what_to_do = int(input('\nChoice: '))
+                if not 0 < what_to_do < 3:
+                    raise ValueError
+                break
+            except ValueError:
+                print('Invalid input.')
+        if subjects_db.user_id is None:
+            self.do_login('')
+        if subjects_db.user_id is None:
+            return
+        self.do_print('')
+        if ask_yes_no('Auto-select your registered classes?'):
+            print()
+            self.do_autoselect('')
+        if ask_yes_no('Edit class selection?'):
+            self.do_print('')
+            while True:
+                try:
+                    subject_index = int(input('Select which subject: '))-1
+                    class_indexes = [ord(char)-ord('a') for char in input("Toggle which classes?: ").replace(',', '').split(' ')]
+                    for index in class_indexes:
+                        subjects_db.selector(None, subject_index, index)
+                    self.do_print('')
+                except (ValueError, TypeError):
+                    print('Invalid input.')
+                if not ask_yes_no('Continue editing?'):
+                    break
+        if what_to_do == 1:
+            start_date = input("Search from what date? YYYY-MM-DD: ")
+            end_date = input("Until what date? YYYY-MM-DD: ")
+            self.do_search(f'date {start_date} {end_date}')
+        elif what_to_do == 2:
+            start_timetable_id = int(input('Define beginning of timetable_id range: '))
+            end_timetable_id = int(input('Define end of timetable_id range: '))
+            self.do_search(f'timetable {start_timetable_id} {end_timetable_id}')
 
     def default(self, line):
         print(f"Command not found: '{line}'. Enter 'help' to list commands.\n")
@@ -482,13 +556,59 @@ class Prompt(cmd.Cmd):
         "————————————————————————————————————————————————\n"
         "Syntax:   help [command]                        \n")
 
-    def help_syntax_format(self):
-        print("\n"
-        "Arguments in...                      \n"
-        "    1. Angle brackets is <required>  \n"
-        "    2. Square brackets is [optional] \n")
+    def help_manual(self):
+        print(
+"""Preface: The 'guided' command is a wrapper for commands described under this
+entry. As such, it may be simpler to use that command instead.
 
-if os.name == 'nt':
+    There are three main steps to start scraping for attendance links: Setting
+up required information, selecting what to search, and lastly, starting the
+attendance search itself.
+
+First step:     Setting up required information.
+————————————————————————————————————————————————————————————————————————————————
+Commands:       login
+Syntax:         login [student_id]
+
+    The script requires certain information before it could start. For instance,
+as typical sought-after attendance links are for registered subjects, the script
+is able to programmatically obtain required information by simply logging in to
+MMLS.
+
+Second step:    Displaying and selecting what to search.
+————————————————————————————————————————————————————————————————————————————————
+Commands:       print, select, deselect, toggle, and autoselect.
+Syntax:         print
+                select|deselect|toggle <i.e. '1a 2abc 3' and 'all'>
+                autoselect
+
+    After the script has logged in and parsed the required information, a list
+of subjects and its classes could be displayed by using the 'print' command.
+There will be selection boxes accompanying the class entries which signifies
+whether the class will be searched for its attendance links. Altering class
+selections can be done using the 'select', 'deselect', and 'toggle' command. On
+the other hand, the 'autoselect' command is available which can automatically
+select registered classes.
+
+Third step:     Starting attendance link scraping.
+————————————————————————————————————————————————————————————————————————————————
+Commands:       search date and search timetable.
+Syntax:         search date <start_date> <end_date>
+                search date <date>
+                search date ...leave empty to search for today.
+                search timetable <start_timetable_id> <end_timetable_id>
+
+    The way this script works is by iterating through timetable IDs for selected
+class IDs then formats them into an attendance link if the timetable ID belongs
+to one of the selected classes. A date search can be conducted by using the
+'search date' command with date entered in the format of yyyy-mm-dd. The command
+searches for the first occurence and last occurence of the timetable IDs which
+falls into the specified date range and uses those as the attendance timetable
+ID search range. Alternatively, one could skip the date search by manually
+providing the timetable ID range to search using the 'search timetable' command.
+Found attendance links are displayed as it is searched.\n""")
+
+if os.name == 'nt': #aiohttp is noisy/buggy with ProactorEventLoop on Windows
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 if __name__ == '__main__':
@@ -496,10 +616,10 @@ if __name__ == '__main__':
     prompt = Prompt()
     prompt.prompt = '> '
     prompt.intro = ("                                           \n"
-                    " _____ _____ __    _____   .\\\\Steps:       \n"
-                    "|     |     |  |  |   __|   > login        \n"
-                    "| | | | | | |  |__|__   |   > autoselect   \n"
-                    "|_|_|_|_|_|_|_____|_____|_  > search date  \n"
+                    " _____ _____ __    _____                   \n"
+                    "|     |     |  |  |   __|   .\\\\To start:   \n"
+                    "| | | | | | |  |__|__   |    > guided      \n"
+                    "|_|_|_|_|_|_|_____|_____|_                 \n"
                     "|  _  | |_| |_ ___ ___ _| |___ ___ ___ ___ \n"
                     "|     |  _|  _| -_|   | . | .'|   |  _| -_|\n"
                     "|__|__|_| |_| |___|_|_|___|__,|_|_|___|___|\n"
