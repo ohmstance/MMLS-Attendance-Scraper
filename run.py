@@ -70,7 +70,7 @@ def change_selection(args, op):
             else:
                 for cls_idx in class_set:
                     try:
-                        subjects[sub_idx].classes[cls_idx].selected = op if op is not None else not kelas.selected
+                        subjects[sub_idx].classes[cls_idx].selected = op if op is not None else not subjects[sub_idx].classes[cls_idx].selected
                     except IndexError:
                         pass
     return True
