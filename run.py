@@ -100,7 +100,7 @@ class Prompt(cmd.Cmd):
     def do_autoselect(self, args):
         ("\nAuto-select classes that the student has registered for.\n")
         if self.user_id is not None:
-            asyncio.run(mmlsattendance.autoselect(subject_db, self.user_id))
+            asyncio.run(mmlsattendance.autoselect_classes(subject_db, self.user_id))
             print_subjects(subject_db)
             print()
         else:
@@ -183,13 +183,12 @@ class Prompt(cmd.Cmd):
             else:
                 print(f"Searching classes in {start_date.isoformat()}.")
             async def scrape_and_print(start_date, end_date, subject_db):
-                scraper = mmlsattendance.Scraper(subject_db)
                 queue = asyncio.Queue()
                 printer_task = asyncio.create_task(printer(queue))
-                await scraper.scrape_date(start_date, start_date, queue = queue)
+                await mmlsattendance.scrape_date(subject_db, start_date, start_date, queue = queue)
                 await queue.join()
                 printer_task.cancel()
-                await asyncio.gather(printer_task, return_exceptions = True)
+                await asyncio.wait([printer_task])
             asyncio.run(scrape_and_print(start_date, end_date, subject_db))
         # =============== search timetable <start_id> <end_id> ===============
         elif cmd == 'timetable':
@@ -205,13 +204,12 @@ class Prompt(cmd.Cmd):
                 return
             print(f"Searching classes from {start_timetable_id} to {end_timetable_id}.")
             async def scrape_and_print(start_timetable_id, end_timetable_id, subject_db):
-                scraper = mmlsattendance.Scraper(subject_db)
                 queue = asyncio.Queue()
                 printer_task = asyncio.create_task(printer(queue))
-                await scraper.scrape(start_timetable_id, end_timetable_id, queue = queue)
+                await mmlsattendance.scrape(subject_db, start_timetable_id, end_timetable_id, queue = queue)
                 await queue.join()
                 printer_task.cancel()
-                await asyncio.gather(printer_task, return_exceptions = True)
+                await asyncio.wait([printer_task])
             asyncio.run(scrape_and_print(start_timetable_id, end_timetable_id, subject_db))
         print()
 

@@ -8,16 +8,16 @@ MAX_CONCURRENT_REQUESTS = 6
 NETWORK_TIMEOUT = 15
 NETWORK_RETRIES = 3
 NETWORK_RETRY_BACKOFF = 3
+MAX_TIMETABLE_ID = 99_999
+MIN_TIMETABLE_ID = 1
 
 async def _request(method, url, *, data = None, params = None, headers = None, cookies = None,
                    session = None, semaphore = None):
     """An internal function that wraps aiohttp.request to enable timeout, retries,
     and retry backoff time, while also making use of asyncio.Semaphore() to throttle
     concurrent requests."""
-    if session is None:
-        session = aiohttp.ClientSession()
-    if semaphore is None:
-        semaphore = asyncio.Semaphore()
+    session = session or aiohttp.ClientSession()
+    semaphore = semaphore or asyncio.Semaphore()
     timeout = aiohttp.ClientTimeout(total=NETWORK_TIMEOUT)
     async with semaphore:
         for _ in range(NETWORK_RETRIES):
@@ -29,240 +29,210 @@ async def _request(method, url, *, data = None, params = None, headers = None, c
         return await session.request(method, url, data=data, params=params, headers=headers,
                                      cookies=cookies, timeout=timeout)
 
-async def load_online(SubjectDB_obj, user_id, password):
+async def load_online(SubjectDB_obj, user_id, password, *, semaphore = None):
     """Loads registered subjects and all classes in those subjects into a SubjectDB
     object. It needs student ID and password to parse subjects and classes. If
     credentials are incorrect, it returns False, but True if it succeeds."""
+    semaphore = semaphore or asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
     async with aiohttp.ClientSession() as session:
         subjectdb = SubjectDB()
-        response = await _request('GET', 'https://mmls.mmu.edu.my/', session = session)
-        html_etree = etree.parse(StringIO(await response.text()), etree.HTMLParser())
-        cookie = response.cookies
-        token = html_etree.xpath("//input[@name='_token']/@value")[0]
+        resp = await _request('GET', 'https://mmls.mmu.edu.my/', session=session)
+        tree = etree.parse(StringIO(await resp.text()), etree.HTMLParser())
+        cookie = resp.cookies
+        token = tree.xpath("//input[@name='_token']/@value")[0]
         # ===== Log in to MMLS =====
         data = {'stud_id' : user_id, 'stud_pswrd' : password, '_token' : token}
-        response = await _request('POST', 'https://mmls.mmu.edu.my/checklogin', data=data, session = session)
-        if response.status == 500:
+        resp = await _request('POST', 'https://mmls.mmu.edu.my/checklogin', data=data, session=session)
+        if resp.status == 500:
             return False
         # ===== Parse subjects =====
-        html_tree = etree.parse(StringIO(await response.text()), etree.HTMLParser())
+        tree = etree.parse(StringIO(await resp.text()), etree.HTMLParser())
         SUBJECT_XPATH = "//div[@class='list-group ' and @style='margin-top:-15px']/span/a[1]"
-        names = [name.split(' - ') for name in html_tree.xpath(f"{SUBJECT_XPATH}/text()")]
-        links = [link[24:].split(':') for link in html_tree.xpath(f"{SUBJECT_XPATH}/@href")]
+        names = [name.split(' - ') for name in tree.xpath(f"{SUBJECT_XPATH}/text()")]
+        links = [link[24:].split(':') for link in tree.xpath(f"{SUBJECT_XPATH}/@href")]
         names_and_links = [[data for nested_list in zipped for data in nested_list]
-                            for zipped in zip(names, links)]
+                           for zipped in zip(names, links)]
         for code, name, sid, coid in names_and_links:
-            subjectdb.add_subject(int(sid), code = code, name = name, coordinator_id = int(coid))
+            subjectdb.add_subject(int(sid), code=code, name=name, coordinator_id=int(coid))
         # ===== Parse classes =====
-        async def parse_classes(subject, session, sem):
+        async def parse_classes(subject, session, semaphore):
             sid, coid = subject.id, subject.coordinator_id
             class_list_url = f"https://mmls.mmu.edu.my/studentlist:{sid}:{coid}:0"
-            response = await _request('GET', class_list_url, session = session, semaphore = sem)
-            html_etree = etree.parse(StringIO(await response.text()), etree.HTMLParser())
-            CLASS_XPATH = "//select[@id='select_class']/*[not(self::option[@value='0'])]"
-            class_ids = html_etree.xpath(f"{CLASS_XPATH}/@value")
-            class_codes = html_etree.xpath(f"{CLASS_XPATH}/text()")
+            resp = await _request('GET', class_list_url, session=session, semaphore=semaphore)
+            tree = etree.parse(StringIO(await resp.text()), etree.HTMLParser())
+            cls_xpath = "//select[@id='select_class']/*[not(self::option[@value='0'])]"
+            class_ids = tree.xpath(f"{cls_xpath}/@value")
+            class_codes = tree.xpath(f"{cls_xpath}/text()")
             for cid, code in zip(class_ids, class_codes):
-                subject.add_class(int(cid), code = code)
-        sem = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
+                subject.add_class(int(cid), code=code)
         tasks = [asyncio.create_task(
-                parse_classes(subject, session, sem)
+                parse_classes(subject, session, semaphore)
                 ) for subject in subjectdb.subjects]
-        await asyncio.gather(*tasks, return_exceptions = True)
+        await asyncio.wait(tasks)
         SubjectDB_obj.update(subjectdb)
-        await _request('GET', 'https://mmls.mmu.edu.my/logout', session = session)
+        await _request('GET', 'https://mmls.mmu.edu.my/logout', session=session)
         return True
 
-async def autoselect(SubjectDB_obj, user_id):
+async def autoselect_classes(SubjectDB_obj, user_id, *, semaphore = None):
     """Autoselects classes in a SubjectDB object that the user, with the given
     student ID, has registered for in the current trimester."""
-    async def select_if_registered(user_id, class_queue, sem):
-        NOT_REG_XPATH = "//div[@class='alert alert-danger']/text()='You are not register to this class.'"
+    semaphore = semaphore or asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
+    async def select_if_registered(user_id, class_queue, semaphore):
+        not_reg_xpath = "//div[@class='alert alert-danger']/text()='You are not register to this class.'"
         async with aiohttp.ClientSession() as session:
-            await _request('GET', 'https://mmls.mmu.edu.my/attendance:0:0:1', session = session)
+            await _request('GET', 'https://mmls.mmu.edu.my/attendance:0:0:1', session=session)
             while True:
-                async with sem:
+                async with semaphore:
                     kelas = await class_queue.get()
                     data = {'class_id': kelas.id, 'stud_id': user_id, 'stud_pswrd': '0'}
                     headers = {'Referer': 'https://mmls.mmu.edu.my/attendance:0:0:1'}
-                    response = await _request('POST', 'https://mmls.mmu.edu.my/attendancelogin',
-                                              data = data, headers = headers, session = session)
-                    html_etree = etree.parse(StringIO(await response.text()), etree.HTMLParser())
-                    if not html_etree.xpath(NOT_REG_XPATH):
+                    resp = await _request('POST', 'https://mmls.mmu.edu.my/attendancelogin',
+                                         data=data, headers=headers, session=session)
+                    tree = etree.parse(StringIO(await resp.text()), etree.HTMLParser())
+                    if not tree.xpath(not_reg_xpath):
                         kelas.selected = True
                     class_queue.task_done()
     class_queue = asyncio.Queue()
-    sem = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
     tasks = [asyncio.create_task(
-            select_if_registered(user_id, class_queue, sem)
-            ) for _ in range(MAX_CONCURRENT_REQUESTS)]
+            select_if_registered(user_id, class_queue, semaphore)
+            ) for _ in range(semaphore._value)]
     for kelas in SubjectDB_obj.classes:
         class_queue.put_nowait(kelas)
     await class_queue.join()
     for task in tasks:
         task.cancel()
-    await asyncio.gather(*tasks, return_exceptions=True)
+    await asyncio.wait(tasks)
 
-class Scraper:
-    MAX_TIMETABLE_ID = 99_999
-    MIN_TIMETABLE_ID = 1
-    # _form_fields_cache = [None]*(MAX_TIMETABLE_ID+MIN_TIMETABLE_ID)
+async def scrape(SubjectDB_obj, start_timetable_id, end_timetable_id, *, queue = None, semaphore = None):
+    """Searches for timetable ID belonging to any selected class in the instance's
+    loaded SubjectDB object given a range of timetable ID. Returns a list of
+    ScrapedTimetable objects. If an asyncio.Queue() object is provided, it
+    queues resultant ScrapedTimetable objects in that instead."""
+    semaphore = semaphore or asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
+    async with aiohttp.ClientSession() as session:
+        scraped_timetables = []
+        semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
+        tasks = [asyncio.create_task(
+                _request('GET', f"https://mmls.mmu.edu.my/attendance:0:0:{timetable_id}", 
+                        session=session, semaphore=semaphore))
+                for timetable_id in range(start_timetable_id, end_timetable_id+1)]
+        class_id_to_class_obj = {kelas.id: kelas for kelas in SubjectDB_obj.selected_classes}
+        while tasks:
+            resp = await tasks.pop(0)
+            if resp.status == 500:
+                for task in tasks:
+                    task.cancel()
+                break
+            tree = etree.parse(StringIO(await resp.text()), etree.HTMLParser())
+            class_id = int(tree.xpath("//input[@name='class_id']/@value")[0])
+            if class_id in class_id_to_class_obj:
+                kelas = class_id_to_class_obj[class_id]
+                scraped_timetable = ScrapedTimetable(
+                    timetable_id = int(tree.xpath("//input[@name='timetable_id']/@value")[0]),
+                    start_time = tree.xpath("//input[@name='starttime']/@value")[0][:-3],
+                    end_time = tree.xpath("//input[@name='endtime']/@value")[0][:-3],
+                    class_date = tree.xpath("//input[@name='class_date']/@value")[0],
+                    class_id = class_id,
+                    class_code = kelas.code,
+                    subject_code = kelas.subject.code,
+                    subject_name = kelas.subject.name,
+                    subject_id = kelas.subject.id,
+                    coordinator_id = kelas.subject.coordinator_id
+                    )
+                if queue is None:
+                    scraped_timetables.append(scraped_timetable)
+                else:
+                    await queue.put(scraped_timetable)
+        if queue is None:
+            return scraped_timetables
 
-    def __init__(self, SubjectDB_obj):
-        self._SubjectDB = SubjectDB_obj
-
-    # async def _fetch_attendance_url_fields(self, timetable_id, session = None, semaphore = None):
-    #     if isinstance(self.__class__._form_fields_cache[timetable_id], dict):
-    #         return self.__class__._form_fields_cache[timetable_id]
-    #     else:
-    #         response = await _request('GET', f"https://mmls.mmu.edu.my/attendance:0:0:{timetable_id}",
-    #                                   session = session, semaphore = semaphore)
-    #         if response.status == 500:
-    #             return None
-    #         html_etree = etree.parse(StringIO(await response.text() ), etree.HTMLParser())
-    #         form_fields = {
-    #             'timetable_id': timetable_id,
-    #             'starttime': html_etree.xpath("//input[@name='starttime']/@value")[0][:-3],
-    #             'endtime': html_etree.xpath("//input[@name='endtime']/@value")[0][:-3],
-    #             'class_date': html_etree.xpath("//input[@name='class_date']/@value")[0],
-    #             'class_id': int(html_etree.xpath("//input[@name='class_id']/@value")[0]),
-    #         }
-    #         self.__class__._form_fields_cache[timetable_id] = form_fields
-    #         return form_fields
-
-    async def _fetch_attendance_url_fields(self, timetable_id, session = None, semaphore = None):
-        """Fetches form fields of attendance URLs of timetable ID and returns a
-        dict of those fields. The fields are supposed to be cached, but due to
-        memory bloat, it is scrapped until an alternative method could be made."""
-        response = await _request('GET', f"https://mmls.mmu.edu.my/attendance:0:0:{timetable_id}",
-                                  session = session, semaphore = semaphore)
-        if response.status == 500:
-            return None
-        html_etree = etree.parse(StringIO(await response.text()), etree.HTMLParser())
-        return {
-            'timetable_id': timetable_id,
-            'starttime': html_etree.xpath("//input[@name='starttime']/@value")[0][:-3],
-            'endtime': html_etree.xpath("//input[@name='endtime']/@value")[0][:-3],
-            'class_date': html_etree.xpath("//input[@name='class_date']/@value")[0],
-            'class_id': int(html_etree.xpath("//input[@name='class_id']/@value")[0]),
-        }
-
-    async def _date_to_timetable(self, date, option, session):
-        """Returns a timetable ID by doing a binary search on a range timetable IDs
-        for either the first occurence or the last occurence of a given date.
-        option = 1 for first occurence and option = -1 for last occurence."""
-        upperbound, lowerbound = self.MAX_TIMETABLE_ID, self.MIN_TIMETABLE_ID
-        CLASS_DATE_XPATH = "//input[@name='class_date']/@value"
-        while(True): #Option: 1 for first occurence, -1 for last occurence.
-            curr_timetable = (upperbound+lowerbound)//2
-            form_fields = await self._fetch_attendance_url_fields(curr_timetable, session)
-            if form_fields is None:
-                upperbound = curr_timetable-1
-                continue
-            current_date = date.fromisoformat(form_fields['class_date'])
-            if (date - current_date).days > 0:
-                lowerbound = curr_timetable+1
-            elif (date - current_date).days < 0:
-                upperbound = curr_timetable-1
-            else:
-                form_fields = await self._fetch_attendance_url_fields(curr_timetable-option, session)
-                if form_fields is None:
-                    curr_timetable
-                if date.fromisoformat(form_fields['class_date']) != current_date:
-                    return curr_timetable
-                if option == 1:
-                    upperbound = curr_timetable-1
-                elif option == -1:
-                    lowerbound = curr_timetable+1
-            if upperbound < lowerbound:
+async def scrape_date(SubjectDB_obj, start_date, end_date, *, queue = None, semaphore = None):
+    """Wraps scrape() and date_to_timetable(). Gets the first or the last
+    timetable ID with the input dates, then uses the timetable IDs as the
+    range of scrape(). Returns a list of ScrapedTimetable objects. If an
+    asyncio.Queue() object is provided, it queues resultant ScrapedTimetable
+    objects in that instead."""
+    semaphore = semaphore or asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
+    async with aiohttp.ClientSession() as session:
+        start_ttid = end_ttid = None
+        while start_ttid is None or end_ttid is None:
+            if start_ttid is None:
+                start_ttid_task = asyncio.create_task(
+                                  date_to_timetable(start_date, 1, session=session, semaphore=semaphore)
+                                  )
+            if end_ttid is None:
+                end_ttid_task = asyncio.create_task(
+                                date_to_timetable(end_date, -1, session=session, semaphore=semaphore)
+                                )
+            start_ttid = await start_ttid_task
+            end_ttid = await end_ttid_task
+            if not start_ttid:
+                start_date += timedelta(days=1)
+            if not end_ttid:
+                end_date -= timedelta(days=1)
+            if start_date > end_date:
                 return None
+        return await scrape(SubjectDB_obj, start_ttid, end_ttid, queue=queue, semaphore=semaphore)
 
-    async def scrape_date(self, start_date, end_date, *, queue = None):
-        """Wraps scrape() and date_to_timetable(). Gets the first or the last
-        timetable ID with the input dates, then uses the timetable IDs as the
-        range of scrape(). Returns a list of ScrapedTimetable objects. If an
-        asyncio.Queue() object is provided, it queues resultant ScrapedTimetable
-        objects in that instead."""
-        async with aiohttp.ClientSession() as session:
-            start_timetable_id = end_timetable_id = None
-            while start_timetable_id is None or end_timetable_id is None:
-                if start_timetable_id is None:
-                    start_ttid_task = asyncio.create_task(
-                                      self._date_to_timetable(start_date, 1, session))
-                if end_timetable_id is None:
-                    end_ttid_task = asyncio.create_task(
-                                    self._date_to_timetable(end_date, -1, session))
-                start_timetable_id = await start_ttid_task
-                end_timetable_id = await end_ttid_task
-                if not start_timetable_id:
-                    start_date += timedelta(days=1)
-                if not end_timetable_id:
-                    end_date -= timedelta(days=1)
-                if start_date > end_date:
-                    return None
-            return await self.scrape(start_timetable_id, end_timetable_id, queue = queue)
-
-    async def scrape(self, start_timetable_id, end_timetable_id, *, queue = None):
-        """Searches for timetable ID belonging to any selected class in the instance's
-        loaded SubjectDB object given a range of timetable ID. Returns a list of
-        ScrapedTimetable objects. If an asyncio.Queue() object is provided, it
-        queues resultant ScrapedTimetable objects in that instead."""
-        async with aiohttp.ClientSession() as session:
-            scraped_timetables = []
-            sem = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
-            tasks = [asyncio.create_task(
-                     self._fetch_attendance_url_fields(timetable_id, session = session, semaphore = sem))
-                     for timetable_id in range(start_timetable_id, end_timetable_id+1)]
-            class_id_to_class_obj = {kelas.id: kelas for kelas in self._SubjectDB.selected_classes}
-            while tasks:
-                form_fields = await tasks.pop(0)
-                if form_fields is None:
-                    for task in tasks:
-                        task.cancel()
-                    break
-                class_id = form_fields['class_id']
-                if class_id in class_id_to_class_obj:
-                    kelas = class_id_to_class_obj[class_id]
-                    scraped_timetable = ScrapedTimetable(
-                        timetable_id = form_fields['timetable_id'],
-                        start_time = form_fields['starttime'],
-                        end_time = form_fields['endtime'],
-                        class_date = form_fields['class_date'],
-                        class_id = class_id,
-                        class_code = kelas.code,
-                        subject_code = kelas.subject.code,
-                        subject_name = kelas.subject.name,
-                        subject_id = kelas.subject.id,
-                        coordinator_id = kelas.subject.coordinator_id
-                        )
-                    if queue is None:
-                        scraped_timetables.append(scraped_timetable)
-                    else:
-                        await queue.put(scraped_timetable)
-            if queue is None:
-                return scraped_timetables
+async def date_to_timetable(date, option, *, session = None, semaphore = None):
+    """Returns a timetable ID by doing a binary search on a range timetable IDs
+    for either the first occurence or the last occurence of a given date.
+    option = 1 for first occurence and option = -1 for last occurence."""
+    if not (option == 1 or option == -1):
+        raise ValueError("Option must be 1 or -1")
+    ubound, lbound = MAX_TIMETABLE_ID, MIN_TIMETABLE_ID
+    semaphore = semaphore or asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
+    session = session or aiohttp.ClientSession()
+    async with semaphore:
+        while(True): #Option: 1 for first occurence, -1 for last occurence.
+            curr_ttid = (ubound+lbound)//2
+            resp = await _request('GET', f"https://mmls.mmu.edu.my/attendance:0:0:{curr_ttid}", 
+                                 session=session)
+            if resp.status == 500:
+                ubound = curr_ttid-1
+                continue
+            tree = etree.parse(StringIO(await resp.text()), etree.HTMLParser())
+            curr_date = date.fromisoformat(tree.xpath("//input[@name='class_date']/@value")[0])
+            if (date - curr_date).days > 0:
+                lbound = curr_ttid+1
+            elif (date - curr_date).days < 0:
+                ubound = curr_ttid-1
+            else:
+                resp = await _request('GET', f"https://mmls.mmu.edu.my/attendance:0:0:{curr_ttid-option}", 
+                                     session=session)
+                if resp.status == 500:
+                    return curr_ttid
+                tree = etree.parse(StringIO(await resp.text()), etree.HTMLParser())
+                if date.fromisoformat(tree.xpath("//input[@name='class_date']/@value")[0]) != curr_date:
+                    return curr_ttid
+                if option == 1:
+                    ubound = curr_ttid-1
+                elif option == -1:
+                    lbound = curr_ttid+1
+            if ubound < lbound:
+                return None
 
 class SubjectDB:
     """A container for subjects and classes with built-in methods."""
     class Subject:
         class Class:
-            def __init__(self, subject_obj, cid, *, code = None, selected = False):
+            def __init__(self, Subject_obj, cid, *, code = None, selected = False):
                 self.id = cid
                 self.code = code
                 self.selected = selected
-                self._Subject = subject_obj
+                self._Subject = Subject_obj
 
             @property
             def subject(self):
                 return self._Subject
 
-        def __init__(self, subjectdb_obj, sid, *, code = None, name = None, coordinator_id = None):
+        def __init__(self, SubjectDB_obj, sid, *, code = None, name = None, coordinator_id = None):
             self.id = sid
             self.code = code
             self.name = name
             self.coordinator_id = coordinator_id
             self._classes = []
-            self._SubjectDB = subjectdb_obj
+            self._SubjectDB = SubjectDB_obj
 
         def add_class(self, cid, code = None, selected = False):
             """Adds a class (Class object) to an internal list. Checks if there is
