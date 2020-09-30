@@ -28,7 +28,7 @@ async def printer(queue):
     while True:
         f = await queue.get()
         print()
-        print(f"[{f.class_date} {f.start_time}-{f.end_time}] {f.subject_code} - {f.subject_name} ({f.class_code})")
+        print(f"[{f.class_date} {f.start_time[:-3]}-{f.end_time[:-3]}] {f.subject_code} - {f.subject_name} ({f.class_code})")
         print(f.attendance_url)
         if PRINT_ATTENDANCE_LIST:
             if f.attendance_list_url:
@@ -86,7 +86,7 @@ class Prompt(cmd.Cmd):
         "Syntax:   login [student_id]                                \n")
         user_id = args.split()[0] if args else input('Student ID: ')
         password = getpass.getpass()
-        if asyncio.run(mmlsattendance.load_online(subject_db, user_id, password)):
+        if loop.run_until_complete(mmlsattendance.load_online(subject_db, user_id, password)):
             print('Success.\n')
             self.user_id = user_id
         else:
@@ -100,7 +100,10 @@ class Prompt(cmd.Cmd):
     def do_autoselect(self, args):
         ("\nAuto-select classes that the student has registered for.\n")
         if self.user_id is not None:
-            asyncio.run(mmlsattendance.autoselect_classes(subject_db, self.user_id))
+            import time
+            then = time.time()
+            loop.run_until_complete(mmlsattendance.autoselect_classes(subject_db, self.user_id))
+            print(f"Took {time.time()-then:.2f}")
             print_subjects(subject_db)
             print()
         else:
@@ -176,7 +179,7 @@ class Prompt(cmd.Cmd):
                     start_date = date.fromisoformat(args_list[0])
                     end_date = date.fromisoformat(args_list[1])
             except ValueError as err:
-                print(f"{err}. Use format YYYY-MM-DD.\n")
+                print(f"{err.capitalize()}.\n")
                 return
             if len(args_list) == 2:
                 print(f"Searching classes from {start_date.isoformat()} to {end_date.isoformat()}.")
@@ -185,11 +188,11 @@ class Prompt(cmd.Cmd):
             async def scrape_and_print(start_date, end_date, subject_db):
                 queue = asyncio.Queue()
                 printer_task = asyncio.create_task(printer(queue))
-                await mmlsattendance.scrape_date(subject_db, start_date, start_date, queue = queue)
+                await mmlsattendance.scrape_date(subject_db, start_date, end_date, queue = queue)
                 await queue.join()
                 printer_task.cancel()
                 await asyncio.wait([printer_task])
-            asyncio.run(scrape_and_print(start_date, end_date, subject_db))
+            loop.run_until_complete(scrape_and_print(start_date, end_date, subject_db))
         # =============== search timetable <start_id> <end_id> ===============
         elif cmd == 'timetable':
             args_list = args.split()
@@ -210,8 +213,54 @@ class Prompt(cmd.Cmd):
                 await queue.join()
                 printer_task.cancel()
                 await asyncio.wait([printer_task])
-            asyncio.run(scrape_and_print(start_timetable_id, end_timetable_id, subject_db))
+            loop.run_until_complete(scrape_and_print(start_timetable_id, end_timetable_id, subject_db))
         print()
+
+    def do_cache(self, args):
+        ("\n"
+        "Cache attendances in a specified timetable ID range.\n"
+        "————————————————————————————————————————————————————\n"
+        "Syntax:   cache <start_id> <end_id>                 \n"
+        "          cache all                                 \n")
+        if not mmlsattendance.CONNECT_DB:
+            print(f"Please enable caching function to use this command.\n")
+            return
+        args_list = args.split()
+        try:
+            if len(args_list) == 1:
+                if args_list[0] == 'all':
+                    start_ttid = end_ttid = None
+                else:
+                    print(f"Invalid argument. Enter 'help search' for command help.\n")
+                    return
+            elif len(args_list) == 2:
+                start_ttid = int(args_list[0])
+                end_ttid = int(args_list[1])
+            elif len(args_list) == 0:
+                print(f"Missing arguments. Enter 'help search' for command help.\n")
+                return
+            else:
+                print(f"Too many arguments. Enter 'help search' for command help.\n")
+                return
+        except ValueError:
+            print(f"Value error. Enter 'help search' for command help.\n")
+            return
+        num_cached = mmlsattendance.total_cached_timetable_ids()
+        print('This could take a while. Working...')
+        new_num_cached = loop.run_until_complete(mmlsattendance.cache_timetable_ids(start_ttid, end_ttid))
+        print(f"Cached: {new_num_cached} (+{new_num_cached-num_cached})")
+        print('Done!\n')
+
+    def do_cached(self, args):
+        ("\nPrint the number of cached attendances.\n")
+        if not mmlsattendance.CONNECT_DB:
+            print(f"Please enable caching function to use this command.\n")
+            return
+        num_cached = mmlsattendance.total_cached_timetable_ids()
+        print(f'Total cached: {num_cached}\n')
+
+    def do_json(self, args):
+        print(subject_db.json)
 
     def do_exit(self, args):
         ("\nTerminate this script.\n")
@@ -334,11 +383,8 @@ ID search range. Alternatively, one could skip the date search by manually
 providing the timetable ID range to search using the 'search timetable' command.
 Found attendance links are displayed as it is searched.\n""")
 
-
-if os.name == 'nt': #aiohttp is noisy/buggy with ProactorEventLoop on Windows
-    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-
 if __name__ == '__main__':
+    loop = asyncio.get_event_loop()
     subject_db = mmlsattendance.SubjectDB()
     prompt = Prompt()
     prompt.prompt = '> '
