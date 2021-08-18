@@ -229,6 +229,42 @@ async def update_cache(attendance_cache: AttendanceCache = None,
     logging.info(f"Start/end timetable ID: {start_timetable_id}/{end_timetable_id}")
 
     async with aiohttp.ClientSession(connector=connector, connector_owner=False) as session:
+        
+        # Check if the first three cached attendance URLs' date matches online. If not, cache is deemed invalid and cleared.
+        attendance_cache_generator = (timetable_id for timetable_id in attendance_cache.keys())
+        head_timetable_ids = []
+        for _ in range(3):
+            try:
+                head_timetable_ids.append(next(attendance_cache_generator))
+            except StopIteration:
+                pass
+        tasks = [asyncio.create_task(_request('GET', f"https://mmls.mmu.edu.my/attendance:0:0:{timetable_id}", session=session)) for timetable_id in head_timetable_ids]
+        try:
+            responses = await asyncio.gather(*tasks)
+        except asyncio.CancelledError:
+            for task in tasks:
+                task.cancel()
+                raise
+            await asyncio.wait(tasks)
+        for index, response in enumerate(responses):
+            async with response:
+                if response.status == 500:
+                    if index+1 == len(head_timetable_ids):
+                        attendance_cache = {}
+                        logging.warning(f"Attendance cache mismatch at timetable IDs: {head_timetable_ids}.")
+                elif response.status != 200:
+                    raise MMLSResponseError(f'Response status not OK. Received {response.status}',
+                                            response.status)
+                else:
+                    html = lxml.html.fromstring(await response.text())
+                    requested_class_date = html.xpath("//input[@name='class_date']/@value")[0]
+                    cached_class_date = attendance_cache[head_timetable_ids[index]]['class_date']
+                    if cached_class_date == requested_class_date:
+                        break   
+                    elif index+1 == len(head_timetable_ids):
+                        attendance_cache = {}
+                        logging.warning(f"Attendance cache mismatch at timetable IDs: {head_timetable_ids}.")
+
         # First update current and future timetable IDs that are cached.
         if update_cached:
             timezone_mst = timezone(timedelta(hours=8))
@@ -423,7 +459,8 @@ class Scraper:
     @default_connector
     async def scrape_date(self, courses: Courses, start_date: date, end_date: date, *,
                           fast: bool = True,
-                          connector: aiohttp.TCPConnector = None) -> AsyncGenerator[DetailedAttendanceForm, None]:
+                          connector: aiohttp.TCPConnector = None,
+                          do_requests: bool = True) -> AsyncGenerator[DetailedAttendanceForm, None]:
         """
         Scrapes for attendance URLs within the range of start_date to end_date and yields attendances belonging to
         classes which are selected in courses.
@@ -444,6 +481,7 @@ class Scraper:
                             searches for a timetable ID with a date roughly 1-2 months prior to the specified start date
                             and starts scraping from there.
         connector:          pass aiohttp.TCPConnector to share connector for connection keepaliving.
+        do_requests:        if False, don't do HTTP requests. Uses cache only.
         """
 
         # Keeps track of which attendance URLs of selected class are cached.
@@ -472,6 +510,10 @@ class Scraper:
                         coordinator_id=class_id_to_class[attendance_info["class_id"]].subject.coordinator_id
                     )
                     yield detailed_attendance
+
+        # Immediately stop after finishing search from cache.
+        if not do_requests:
+            return
 
         # Use fast approach by looking for the exact timetable ID range to scrape by binary search so as to not spend
         # too much time fetching attendance URLs that don't belong within the specified date range.

@@ -1,3 +1,9 @@
 Lib/
 Scripts/
 pyvenv.cfg
+/attendance_cache.json
+/courses.json
+.idea/
+.vscode/
+__pycache__/
+workspace.code-workspace
