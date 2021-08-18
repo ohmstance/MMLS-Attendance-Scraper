@@ -122,7 +122,7 @@ async def _request(method: str, url: str, *,
 
 
 @default_connector
-async def update_cache(attendance_cache: AttendanceCache = None,
+async def update_cache(attendance_cache: Union[None, str, io.TextIOBase, AttendanceCache] = None,
                        update_cached: bool = True, start_timetable_id: int = None, end_timetable_id: int = None, *,
                        connector: aiohttp.TCPConnector = None) -> AttendanceCache:
     """
@@ -144,6 +144,25 @@ async def update_cache(attendance_cache: AttendanceCache = None,
     """
 
     attendance_cache = attendance_cache or {}
+
+    if attendance_cache is None:
+        temp_cache = {}
+    elif isinstance(attendance_cache, io.TextIOBase):
+        temp_cache = _json.load(attendance_cache)
+    elif isinstance(attendance_cache, str):
+        temp_cache = _json.loads(attendance_cache)
+    elif isinstance(attendance_cache, dict):
+        temp_cache = attendance_cache
+    else:
+        raise TypeError(f"'str', 'dict', or text file is expected, not {type(ext_cache)} object.")
+    attendance_cache = {
+        int(timetable_id): {
+            "starttime": attendance_info["starttime"],
+            "endtime": attendance_info["endtime"],
+            "class_date": attendance_info["class_date"],
+            "class_id": int(attendance_info["class_id"])
+        } for timetable_id, attendance_info in temp_cache.items()
+    }
 
     async def feeder(t_timetable_ids: list[int], t_session: aiohttp.ClientSession, task_queue: asyncio.Queue) \
             -> None:
@@ -229,7 +248,7 @@ async def update_cache(attendance_cache: AttendanceCache = None,
     logging.info(f"Start/end timetable ID: {start_timetable_id}/{end_timetable_id}")
 
     async with aiohttp.ClientSession(connector=connector, connector_owner=False) as session:
-        
+
         # Check if the first three cached attendance URLs' date matches online. If not, cache is deemed invalid and cleared.
         attendance_cache_generator = (timetable_id for timetable_id in attendance_cache.keys())
         head_timetable_ids = []
@@ -260,7 +279,7 @@ async def update_cache(attendance_cache: AttendanceCache = None,
                     requested_class_date = html.xpath("//input[@name='class_date']/@value")[0]
                     cached_class_date = attendance_cache[head_timetable_ids[index]]['class_date']
                     if cached_class_date == requested_class_date:
-                        break   
+                        break
                     elif index+1 == len(head_timetable_ids):
                         attendance_cache = {}
                         logging.warning(f"Attendance cache mismatch at timetable IDs: {head_timetable_ids}.")
@@ -340,20 +359,20 @@ class Scraper:
         return self._attendance_cache
 
     @attendance_cache.setter
-    def attendance_cache(self, ext_cache: Union[None, str, io.TextIOBase, AttendanceCache]):
+    def attendance_cache(self, attendance_cache: Union[None, str, io.TextIOBase, AttendanceCache]):
         """
         Assigns attendance cache to the instance. It accepts json file, json string, or dict of attendance cache, and
         converts any form of passed attendance cache into an internally used format.
         """
 
-        if ext_cache is None:
-            attendance_cache = {}
-        elif isinstance(ext_cache, io.TextIOBase):
-            attendance_cache = _json.load(ext_cache)
-        elif isinstance(ext_cache, str):
-            attendance_cache = _json.loads(ext_cache)
-        elif isinstance(ext_cache, dict):
-            attendance_cache = ext_cache
+        if attendance_cache is None:
+            temp_cache = {}
+        elif isinstance(attendance_cache, io.TextIOBase):
+            temp_cache = _json.load(attendance_cache)
+        elif isinstance(attendance_cache, str):
+            temp_cache = _json.loads(attendance_cache)
+        elif isinstance(attendance_cache, dict):
+            temp_cache = attendance_cache
         else:
             raise TypeError(f"'str', 'dict', or text file is expected, not {type(ext_cache)} object.")
         self._attendance_cache: AttendanceCache = {
@@ -362,7 +381,7 @@ class Scraper:
                 "endtime": attendance_info["endtime"],
                 "class_date": attendance_info["class_date"],
                 "class_id": int(attendance_info["class_id"])
-            } for timetable_id, attendance_info in attendance_cache.items()
+            } for timetable_id, attendance_info in temp_cache.items()
         }
 
     @attendance_cache.deleter
