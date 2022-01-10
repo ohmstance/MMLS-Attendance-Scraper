@@ -3,7 +3,7 @@ async-timeout==3.0.1
 attrs==21.2.0
 chardet==4.0.0
 idna==3.2
-lxml==4.6.3
+lxml==4.6.5
 multidict==5.1.0
 typing-extensions==3.10.0.0
 yarl==1.6.3
